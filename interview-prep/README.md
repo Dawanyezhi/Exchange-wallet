@@ -94,30 +94,77 @@ flowchart TD
 
 syncer 拿到新块，第一件事是把新块的 parentHash 和本地 DB 里存的上一块 hash 精确比对，对不上直接触发回滚流程，绝不在可能是分叉链上的交易上做任何处理。通过分叉检测后开始解析这个块里的每笔交易。这里要搞清楚 EVM 主币和 ERC20 在链上的表现是完全不同的，解析方式也不同，但最终都归一到同一个数据结构里传给上层。
 
-主币充值（ETH / BNB / MATIC 等），金额直接在 tx.value 字段，一笔交易产生一个 SimpleTrx：
+主币充值（ETH / BNB / MATIC 等），金额直接在 tx.value 字段，一笔交易产生一个 SimpleTrx。链上 `eth_getTransactionByHash` 返回的原始数据长这样：
+
+```json
+{
+  "hash":  "0x88df016429689c079f3b2f6ad39fa052532c56795b733da78a91ebe6a713944b",
+  "from":  "0xa7d9ddbe1f17865597fbd27ec712455208b6b76d",
+  "to":    "0xf02c1c8e6114b1dbe8937a39260b5b0a374432bb",
+  "value": "0x6f05b59d3b20000",   // ← 主币金额在这里，0.5 ETH（wei 单位）
+  "input": "0x",                  // ← 空，纯转账
+  "blockNumber": "0x11e8480"
+}
+```
+
+解析后归一到内部结构：
 
 ```go
-// ETH 主币充值
 MixRetriver{
-    Chain: "ETH", Height: 18500000, Hash: "0xabc...",
-    Executor: "0xsender...",  // tx.From
+    Chain: "ETH", Height: 18_908_288, Hash: "0x88df...",
+    Executor: "0xa7d9dd...",
     IsSuccess: true,
     List: []*SimpleTrx{
-        {Symbol: "ETH", From: "0xsender...", To: "0xuser_addr...", Value: 1.5ETH},
+        {Symbol: "ETH", From: "0xa7d9dd...", To: "0xf02c1c...", Value: bigint(500_000_000_000_000_000)},
     },
 }
 ```
 
-ERC20 充值（USDT / USDC 等）完全不同，tx.value 是 0，真实金额藏在 Receipt.Logs 里的 Transfer 事件里。解析逻辑是遍历 receipt.Logs，找到 Topics[0] == 0xddf252ad...（Transfer 事件签名）且 Topics 长度为 3 的日志，从 Topics[1][26:] 截取 from 地址（去掉 32 字节里的 12 字节 padding），Topics[2][26:] 截取 to 地址，log.Data 解析金额，核对 log.Address 是否在合约白名单里。一笔交易可以触发多个 Transfer 事件，会产生多条 SimpleTrx：
+ERC20 充值（USDT / USDC 等）完全不同，tx.value 是 0，真实金额藏在 Receipt.Logs 里的 Transfer 事件里。`eth_getTransactionByHash` 返回的交易原始数据：
+
+```json
+{
+  "hash":  "0xb5c8bd9430b6cc87a0e2fe110ece6bf527fa4f170a4bc8cd032f768fc5219838",
+  "from":  "0xa7d9ddbe1f17865597fbd27ec712455208b6b76d",
+  "to":    "0xdac17f958d2ee523a2206206994597c13d831ec7",  // ← to 是 USDT 合约地址，不是用户地址
+  "value": "0x0",                                        // ← 主币金额为 0
+  "input": "0xa9059cbb000000000000000000000000f02c1c8e6114b1dbe8937a39260b5b0a374432bb0000000000000000000000000000000000000000000000000000000005f5e100"
+  //         ^^^^^^^^ transfer(address,uint256) 函数选择器
+  //                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ to 地址（前12字节补零）
+  //                                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 金额 = 0x5f5e100 = 100_000_000 (100 USDT, 6 decimals)
+}
+```
+
+仅凭交易体看不到金额和真实收款人，必须再拉 `eth_getTransactionReceipt` 看 Logs：
+
+```json
+{
+  "status": "0x1",
+  "logs": [
+    {
+      "address": "0xdac17f958d2ee523a2206206994597c13d831ec7",  // ← 合约地址，对照白名单
+      "topics": [
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",  // Transfer 事件签名
+        "0x000000000000000000000000a7d9ddbe1f17865597fbd27ec712455208b6b76d",  // from（32字节，前12字节是padding）
+        "0x000000000000000000000000f02c1c8e6114b1dbe8937a39260b5b0a374432bb"   // to（同上）
+      ],
+      "data": "0x0000000000000000000000000000000000000000000000000000000005f5e100",  // 金额 = 100 USDT
+      "removed": false
+    }
+  ]
+}
+```
+
+解析逻辑：遍历 receipt.Logs，找到 `Topics[0] == 0xddf252ad...` 且 Topics 长度为 3 的日志，`Topics[1][26:]` 截取 from（去掉 32 字节里的 12 字节 zero padding），`Topics[2][26:]` 截取 to，`log.Data` hex 解码得到金额，再核对 `log.Address` 是否在合约白名单里。归一到内部结构：
 
 ```go
-// USDT ERC20 充值（tx.value=0，金额在 Receipt.Logs 的 log.Data）
 MixRetriver{
-    Chain: "ETH", Hash: "0xdef...",
-    Executor: "0xsender...", IsSuccess: true,
+    Chain: "ETH", Hash: "0xb5c8...",
+    Executor: "0xa7d9dd...",  // tx.From，tx.value=0
+    IsSuccess: true,
     List: []*SimpleTrx{
-        // Topics[1][26:] = from, Topics[2][26:] = to, log.Data = amount (6 decimals)
-        {Symbol: "USDT", From: "0xsender...", To: "0xuser_addr...", Value: bigint(100_000000)},
+        // from = Topics[1][26:], to = Topics[2][26:], value = log.Data
+        {Symbol: "USDT", From: "0xa7d9dd...", To: "0xf02c1c...", Value: bigint(100_000_000)},
     },
 }
 ```
