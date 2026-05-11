@@ -174,29 +174,11 @@ MixRetriver{
 }
 ```
 
-**燃烧币（Reflection Token / Fee Token）** 是 EVM 代币充值里最麻烦的一类，需要从原理说起。
+**Reflection Token（反射型 / 通缩代币，又叫 Tax Token）** 充值解析需要了解其原理。正常 ERC20 的 `transfer(to, 100)` 就是 to 收 100。Reflection Token 在合约里加了税——同样调 `transfer(to, 100)`，合约内部自动截走一部分（比如 5%），to 实际只收到 95，被截的 5 进销毁地址或分给所有持有者。关键在于：**被截走的 5 没有独立的 Transfer 事件**，receipt.Logs 里只有一条 Transfer 显示 to 收到 95，那 5 的去向在 logs 里完全看不到。我们项目代码（`irwallet/coinset/type.go`）把这类代币标记为 `TokenFeature = TokenFeeWithoutEvent`——这是项目内部的分类枚举，不是行业术语。还有一种变体 `TokenFeeWithTransferEvents`，burn fee 会额外产生一条 Transfer 事件（通常 to = address(0) 或 fee 合约），两者检测和处理方式不同。
 
-**原理**：正常 ERC20 的 `transfer(to, 100)` 就是让 to 得到 100 个 token。Reflection Token（反射 / 通缩代币）在合约里加了税——调 `transfer(to, 100)` 时，合约内部悄悄截走一部分（比如 5%），to 实际只收到 95，被截的 5 进了销毁地址或按比例分给所有持有者。关键在于：**这 5 个被截走的 token 没有独立的 Transfer 事件**，receipt.Logs 里只有一条 Transfer 显示 to 收到了 95，看不到那 5 的去向——这就是 codebase 里命名 `TokenFeeWithoutEvent` 的含义。另一种变体 `TokenFeeWithTransferEvents` 则会在 logs 里额外产生一条 Transfer 到 burn/fee 地址，两者处理方式不同。
+经典例子：BSC 上的 SafeMoon（SAFEMOON，10% 转账税，5% 销毁 + 5% 分红）是鼻祖，BRISE（Bitgert 链）同理，BSC 上大量 BABY / FLOKI 系 BEP20 都是这个模式。另一类不同的问题是 `badERC20`（代码里的 TOPC、CHZ 链足球粉丝代币 BAR/ACM/PSG/OG 等），这些合约的 `transfer()` 永远返回 false 即使成功了，不是燃烧机制，是合约实现不规范。
 
-**经典例子**：BSC 链上的 SafeMoon（SAFEMOON）是这类代币的鼻祖，10% 转账税（5% 销毁 + 5% 分红），BRISE（Bitgert 链）同理。BSC 链上大量"BABY" / "FLOKI" 系 BEP20 都是这个模式。代码里 `badERC20` map 里的 TOPC、BAR/ACM/PSG（CHZ 链足球粉丝代币）则是另一类问题：合约 `transfer()` 永远返回 false 即使成功了，不是燃烧机制。
-
-**问题在哪**：
-
-充值（用户发 100 SafeMoon 进来）：receipt.Logs 里 to=用户地址 的 Transfer 显示收到 95，就上账 95，这是正确的——用户存了多少，我们就上多少。
-
-提现（用户要提走 100 SafeMoon）：系统调 `transfer(userAddr, 100)`，userAddr 只收到 95，但用户账本必须扣 100（用户要求提 100，不能只扣 95，否则用户可以循环套利），receipt.Logs 显示的是 95。
-
-归集（把用户充值地址的 SafeMoon 归到热钱包）：系统调 `transfer(hotWallet, 100)`，热钱包实际进账 95，这 5 被销毁了。如果账本只记热钱包进了 95 但扣了用户地址 100，对账永远差 5。
-
-**解法**：提现和归集需要知道"原始 input 金额"。`tx.input` 里的 `transfer(to, amount)` 的 `amount` 参数就是调用方填进去的，截取 `trx.Input[74:]` 就能拿到——这个是"发出去多少"，log.Data 是"收到多少"，两者之差是被销毁的部分。
-
-充值路径不需要特殊处理（只有系统地址才触发特殊逻辑）。提现路径：`tval(log.Data) != actualValue(input[74:])` 时把账本记录更新为 actualValue，保证用户扣的是提走的原始量。归集路径：`tval < actualValue` 时额外生成一条 `To=FeeBurnAddress` 的 SimpleTrx，记录销毁量，热钱包入账 tval，销毁记 burned，总和等于 actualValue，对账不会出差。
-
-对于 `TokenFeeWithTransferEvents`（如某些 fee-on-transfer token，burn 有独立 event）：提现时直接用 `tx.input[74:]` 的 amount 上账（不依赖 logs），归集时则先走 `FilterERC20` 拿所有 Transfer 事件，把系统地址的入账累加后和 input amount 比，差值同样记 FEE_BURN。
-
-对于 `badERC20`（TOPC、CHZ 链足球代币 BAR/ACM/PSG 等）：问题不在充值，在提现构建时——`CallContract` 预检会拿到 false 返回值，正常逻辑会以为 transfer 会失败而拒绝广播。解法是把这些 token 配置进 `badERC20` map，设 `NoResCheck=true`，跳过返回值检查。充值解析逻辑完全不受影响，因为充值看的是 receipt.Logs，不是 callContract 的返回值。
-
-这几类特殊 token 对 **对账** 的影响：FEE_BURN 记录的存在让每笔燃烧都有账可查，reconciler 比对链上余额和本地账本时不会出现系统性偏差。如果没有 FEE_BURN，每归集一笔 SafeMoon 热钱包就会少 5%，对账永远报警。
+**充值无需特殊处理**：receipt.Logs 里 to=用户地址 的 Transfer 显示的就是税后实际到账量（95），直接上账就对——用户实际收到多少我们记多少。提现和归集因为是系统地址发起，有额外处理逻辑，详见对应章节。
 
 Solana 的结构和 EVM 完全不同。SOL 原生币转账在 SystemProgram.Transfer 指令里；SPL Token（Solana 上的 USDC/USDT 等）的转账在 TokenProgram.Transfer / TransferChecked 指令里，to 地址是 Associated Token Account（ATA），需要反推出背后的真实持有者地址。一笔 Solana 交易可以包含多个 Instructions，每个可能是一条转账，底层解析方式和 EVM 的 Receipt.Logs 完全不同，但同样归一到 MixRetriver → SimpleTrx 结构，上层 syncer 处理逻辑对链类型透明。
 
@@ -239,6 +221,10 @@ ERC20 提现有额外的注意点：tx.value=0，data 是 ABI 编码的 transfer
 
 第四关是 Nonce 管理，本地缓存严格递增，启动时从 DB 加载记录值不依赖节点状态，Filter 阶段 nonceCache 防并发构建用同一个 Nonce，广播成功后 +1 写回 DB。广播后持续监控确认，超 30 分钟未确认告警，可用 genrbf 工具同 Nonce 提高 Gas Price 做 RBF 加速，上限 maxRBFGasP=200。
 
+**燃烧币（TokenFeeWithoutEvent）提现**：用户要提 100 SafeMoon，系统调 `transfer(userAddr, 100)`，userAddr 实际只收到 95（合约截走 5%）。用户账本必须扣 100，不能只扣 95——否则用户每次提现都能套利（提 100 只扣 95，差额 5 等于白白多了）。但 receipt.Logs 里 Transfer 显示的是 95。解法是读 `tx.input[74:]`——这是 `transfer(to, amount)` 调用里的 amount 参数，是调用方真实填入的 100，用这个值更新账本记录，而不是 log.Data 的 95。
+
+**badERC20 提现**（TOPC、CHZ 链足球代币 BAR/ACM/PSG/OG 等）：这些合约的 `transfer()` 永远返回 false，即使转账实际成功。提现构建时有个 `CallContract` 干调用预检，正常逻辑拿到 false 就认为这笔转账会失败而拒绝广播。解法是把这些 token 配进 `badERC20` map 设 `NoResCheck: true`，跳过返回值检查直接走广播。充值解析完全不受影响，因为充值看 receipt.Logs，不看 callContract 返回值。
+
 ---
 
 ### 2.3 归集流程
@@ -269,6 +255,10 @@ Filter 做安全检查。先查 SafeHeight，保证只对安全高度以下已�
 Build 是核心，ERC20 和主币处理路径不同。ERC20 归集先查这个地址当前的主币余额（RealTimeBalance），因为 ERC20 transfer 的 tx.value=0，data=ABI.encode(transfer(热钱包地址, amount))，但发交易需要主币支付 Gas。预估 Gas 后算 costFee = gasLimit × gasPrice，如果 costFee > AddrEther 就把这个地址发到补 Gas 队列（fchan），先不归集 Token，等补完 Gas 再说。燃烧币（TokenFeeWithoutEvent）归集时 gas limit 额外 +2×MinGas，因为合约内部有销毁操作，不多加容易 OOG。主币归集更直接，转主币剩余量到热钱包，但如果同一地址同时有 ERC20 归集，归集主币时要先把 ERC20 那笔预留的 Gas 费扣掉，AddrEtherCache 维护了这个减法。
 
 补 Gas 金额动态计算：Gas Price ≤10Gwei 补 0.006 ETH，≤50Gwei 补 0.01 ETH，>50Gwei 补 0.1 ETH，Gas 越贵补越多，防止补进去的 Gas 又被高 Gas 费吃掉还不够用。
+
+**燃烧币（TokenFeeWithoutEvent）归集**：系统把用户充值地址的 100 SafeMoon 归到热钱包，调 `transfer(hotWallet, 100)`，热钱包实际入账 95，5 被合约销毁了。如果账本只记热钱包进了 95、用户地址扣了 100，对账永远差 5。解法：对比 `tx.input[74:]` 的 actualValue（100）和 `log.Data` 的 tval（95），`tval < actualValue` 就额外生成一条 `To=FeeBurnAddress` 的 SimpleTrx 记录销毁量（5）——热钱包入账 95 + 销毁记录 5 = 发出的 100，对账平了。Burnable=true 时 gas limit 额外 +2×MinGas（`IncrGasLimit` 里处理），因为合约内部有销毁操作，不多加容易 OOG。
+
+**TokenFeeWithTransferEvents 归集**：这种代币 burn fee 有独立的 Transfer 事件（to = address(0) 或 fee 合约），receipt 里有多条 Transfer。归集走 `FilterERC20` 拿全部 Transfer 事件，把发向热钱包的那些累加得到实际到账量，再和 `tx.input[74:]` 的原始量做差，差值同样生成 FEE_BURN 记录。
 
 ---
 
@@ -326,6 +316,8 @@ flowchart TD
 读本地余额快照（syncer 同步时维护在 DB），RPC 查链上余额，算 diff = 链上余额 - 本地余额，绝对值超过 dvalue 阈值（按 Token 独立配置）才触发告警，Gas 费微小误差不告警。
 
 关键是单调性判断：记录上一轮 prevDiff，和这轮 newDiff 比较。newDiff < prevDiff 说明差值在收敛，可能是 Pending 交易还没被确认进账，级别低的告警；newDiff >= prevDiff 说明差值在持续扩大，是真正的异常，紧急告警立刻处理。两种情况如果一刀切统一告警，正常的处理延迟会淹没真实告警，所以要区分开来。
+
+燃烧币的 FEE_BURN 记录对对账的准确性至关重要。reconciler 比对的是链上余额快照和本地账本，如果没有 FEE_BURN 记录，每归集一笔 SafeMoon 热钱包就会少 5%（发出 100 只进来 95），对账 diff 持续扩大，永远报紧急告警。有了 FEE_BURN 记录之后，账本能看到"热钱包进 95 + 销毁记录 5 = 归集发出的 100"，总量守恒，diff 为 0，不会产生系统性偏差。
 
 ---
 
