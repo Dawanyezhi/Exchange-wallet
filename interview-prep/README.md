@@ -14,14 +14,14 @@
 
 三个角色各自负责什么：
 
-**交易所**：业务方，管用户账本。向钱包服务发提现订单，接收充值确认通知上账。
+**交易所**：业务方，管用户账本。钱包服务请求获取提现订单，接收充值确认通知上账。
 
 **钱包服务**（实际是多个进程，按链类型分）：
 - EVM 链用 **ethfork**，一套代码覆盖 60+ 条 EVM 兼容链（ETH/BSC/Polygon/Arbitrum/zkSync 等），内部有 syncer 扫块+重组检测、wallet 提现执行、collector 归集；链间差异靠 FeatureGate + chaincfg 配置驱动，新增链只加配置文件
 - 非 EVM 链（BTC/XRP/SOL 等）各有独立进程，底层共用 **irwallet** 这个**通用代码库**——irwallet 把 UTXO/Account/Tag 三种链类型的公共逻辑（syncer 扫块+重组检测+充值写库、reconciler 2秒实时对账、firefly 热钱包管理）全部抽象出来，各链实现只需适配链特定的 RPC 调用
 - 所有钱包进程都只发交易哈希给 ksrv，**不持有私钥**
 
-**ksrv**：独立签名服务。主种子 Scrypt+AES 加密落盘；收到交易哈希后，内部完成 BIP32 派生 + 签名，只把签名结果通过 gRPC TLS 传回，**私钥从不离开 ksrv 进程**。
+**ksrv**：独立签名服务。主种子 Scrypt+AES 加密落盘；收到待签名的交易，内部完成 BIP32 派生 + 签名，只把签名结果通过 gRPC TLS 传回，**私钥从不离开 ksrv 进程**。
 
 日常业务四件事：充值（确认后 MQ 通知上账）、提现（签名广播）、归集（散币聚到热钱包）、对账（2 秒一次，偏差立即报警）。
 
@@ -92,17 +92,43 @@ flowchart TD
     L -->|LarkAlarm| N[报警 + 上账]
 ```
 
-充值流程分五个阶段：
+syncer 拿到新块，第一件事是把新块的 parentHash 和本地 DB 里存的上一块 hash 精确比对，对不上直接触发回滚流程，绝不在可能是分叉链上的交易上做任何处理。通过分叉检测后开始解析这个块里的每笔交易。这里要搞清楚 EVM 主币和 ERC20 在链上的表现是完全不同的，解析方式也不同，但最终都归一到同一个数据结构里传给上层。
 
-**分叉检测**：syncer 扫到每个新块，先拿 parentHash 和本地上一块 hash 比——对不上直接触发回滚，不处理可能在分叉链上的交易。
+主币充值（ETH / BNB / MATIC 等），金额直接在 tx.value 字段，一笔交易产生一个 SimpleTrx：
 
-**地址匹配**：遍历块里每笔交易，先过布隆过滤器（只有假阳性，无假阴性，百万地址规模下 O(1)），命中再做精确 DB 查询——按 `to` 地址和 `coin` 精确匹配 user_addresses 表。没命中直接跳过，匹配到就写 inboundtx 表，状态 Pending，包含 txid/from/to/amount/blockHeight。
+```go
+// ETH 主币充值
+MixRetriver{
+    Chain: "ETH", Height: 18500000, Hash: "0xabc...",
+    Executor: "0xsender...",  // tx.From
+    IsSuccess: true,
+    List: []*SimpleTrx{
+        {Symbol: "ETH", From: "0xsender...", To: "0xuser_addr...", Value: 1.5ETH},
+    },
+}
+```
 
-**等待确认**：Mint 用滑动窗口 `[Front, Back]` 计数，每来一块 `queueCaps = Back - Front + 1`，到达配置的确认数（BSC=20 / Polygon=400 / L2链各异）时 `Pop=true`，Front++ 推进安全高度，触发后续处理。
+ERC20 充值（USDT / USDC 等）完全不同，tx.value 是 0，真实金额藏在 Receipt.Logs 里的 Transfer 事件里。解析逻辑是遍历 receipt.Logs，找到 Topics[0] == 0xddf252ad...（Transfer 事件签名）且 Topics 长度为 3 的日志，从 Topics[1][26:] 截取 from 地址（去掉 32 字节里的 12 字节 padding），Topics[2][26:] 截取 to 地址，log.Data 解析金额，核对 log.Address 是否在合约白名单里。一笔交易可以触发多个 Transfer 事件，会产生多条 SimpleTrx：
 
-**二次校验 verifytx**：达到确认数后，独立从另一个 RPC 节点重新拉这笔交易，逐字段比对：`to` 地址必须一致、`symbol` 必须一致、`IsSuccess=true`、金额支持 FuzzyCompare（处理手续费微小差异）。校验失败根据配置走 IgnoreDeposit（不上账 + 告警）或 LarkAlarm（告警但上账）。
+```go
+// USDT ERC20 充值（tx.value=0，金额在 Receipt.Logs 的 log.Data）
+MixRetriver{
+    Chain: "ETH", Hash: "0xdef...",
+    Executor: "0xsender...", IsSuccess: true,
+    List: []*SimpleTrx{
+        // Topics[1][26:] = from, Topics[2][26:] = to, log.Data = amount (6 decimals)
+        {Symbol: "USDT", From: "0xsender...", To: "0xuser_addr...", Value: bigint(100_000000)},
+    },
+}
+```
 
-**KMS 签名上账**：校验通过后，把 `{symbol, txid, to+tag, amount}` 序列化成 proto，用 KMS 私钥签名生成凭证，随充值记录一起推 MQ，交易所收到后验签上账，防止 MQ 中间人伪造充值通知。
+还有一类燃烧币（SafeMoon / BRISE 类），trx.Value != trx.OriginValue，到账金额小于转账金额，差值是合约自动销毁的部分。处理时额外生成一条 To="FEE_BURN" 的 SimpleTrx 记录销毁量，上账只算实际到账的 tval。
+
+Solana 的结构和 EVM 完全不同。SOL 原生币转账在 SystemProgram.Transfer 指令里；SPL Token（Solana 上的 USDC/USDT 等）的转账在 TokenProgram.Transfer / TransferChecked 指令里，to 地址是 Associated Token Account（ATA），需要反推出背后的真实持有者地址。一笔 Solana 交易可以包含多个 Instructions，每个可能是一条转账，底层解析方式和 EVM 的 Receipt.Logs 完全不同，但同样归一到 MixRetriver → SimpleTrx 结构，上层 syncer 处理逻辑对链类型透明。
+
+地址匹配用布隆过滤器先快速筛（百万地址规模 O(1)，只有假阳性无假阴性），命中了再精确查 DB，没命中直接跳过。匹配到就写 inboundtx 表，状态 Pending，记 txid / from / to / amount / blockHeight。
+
+之后进入等待确认阶段，[Front, Back] 滑动窗口计数，到达配置的确认数（BSC=20，Polygon=400——这些数字是根据各链历史分叉深度单独配的，Polygon 400 是 2022 年真实深度分叉后调上去的），Front++ 推进安全高度，触发 verifytx 二次校验。二次校验从另一个独立 RPC 节点重新拉这笔交易，逐字段比对 to / symbol / IsSuccess / 金额（FuzzyCompare 处理微小差异）。校验通过后把 {symbol, txid, to+tag, amount} 序列化成 proto，用 KMS 私钥签名，随充值记录推 MQ 通知交易所上账；校验失败按配置走 IgnoreDeposit（不上账 + 告警）或 LarkAlarm（告警但上账）。
 
 ---
 
@@ -127,17 +153,17 @@ flowchart TD
     N -->|确认成功| P[回调通知交易所]
 ```
 
-提现的核心原则是：**私钥永远不在钱包进程里**。整个流程分五关：
+提现的核心原则是私钥永远不在钱包进程里，整条链路都围绕这一点设计。
 
-**地址校验**：格式检查（正则匹配链地址格式）+ 黑名单匹配。黑名单来自**独立的远程黑名单服务**（HTTP API），本地内存缓存、mutex 保护，后台 goroutine 每分钟定时刷新；HTTP 响应带 Ed25519 签名（由黑名单服务签发，对 `{total, list, timestamp}` 签名），钱包服务验签确保响应未被中间人篡改，同时校验时间戳在 15 秒内防重放，拉到空列表也能验签失败拒绝。任一校验失败拒绝 + Lark 告警。
+拉到提现单，第一关是地址校验。格式检查之后做黑名单匹配，黑名单来自独立的远程黑名单服务而不是本地数据库——钱包持有这个服务的 HTTP baseURL 和 Ed25519 公钥，启动时拉一次缓存到本地 map[string]struct{} 里，后台 goroutine 每分钟刷新，mutex 保护并发读。HTTP 响应服务端附 Ed25519 签名（对 proto.Marshal({total, list, timestamp}) 签名），钱包验签 + 校验时间戳在 15 秒窗口内防重放，拉到空列表但签名不合法直接拒绝，防止中间人清空黑名单放行所有地址。
 
-**余额与 MaxFee 检查**：热钱包余额不足则等待告警；构建完交易后算预估矿工费，和 `maxFeeGwei` 配置比较——Gas Price 超限直接拒绝广播，防止网络拥堵时扛着 200 Gwei 把提现发出去。
+地址校验过了，第二关是余额和 MaxFee 检查。热钱包余额不足等待告警；构建完交易后算 Gas Price × Gas Limit 预估费，和 maxFeeGwei 配置比，超限直接拒绝广播，防止网络拥堵时扛着高 Gas 把提现发出去。
 
-**ksrv 远程签名**：发 `SignRequest{txHash, chainID, derivePath}` 给 ksrv gRPC，ksrv 内部 BIP32 派生子私钥，用 secp256k1/EIP-155 签名后四步清零子私钥，只返回签名结果。钱包收到后调 `VerifySignature` 验证签名合法性，签名校验失败拒绝广播。
+第三关是 ksrv 远程签名。钱包只发 SignRequest{txHash, chainID, derivePath} 通过 gRPC mTLS，ksrv 内部 BIP32 SLIP-0010 硬化路径派生子私钥，secp256k1 + EIP-155 签名，签完四步清零子私钥，只返回 65 字节签名结果。钱包收到后调 VerifySignature 验签，确认签出的确实是自己构建的那笔交易，无效告警拒绝广播，这一步防止 ksrv 被攻击者控制后签出非预期交易。
 
-**Nonce 管理**：Nonce 本地缓存严格递增，启动时从 DB 加载上次记录的值（不依赖节点状态）。Filter 阶段的 nonceCache 防止并发构建交易用同一个 Nonce，广播成功后 +1 写回 DB。
+ERC20 提现有额外的注意点：tx.value=0，data 是 ABI 编码的 transfer(to_addr, amount)，tx.to 是合约地址不是用户地址。构建时先 EstimateGas 预估 gas limit，再 CallContract 干调用一次验证合约不会 revert——有些问题合约不抛异常而是静默返回 false，预检能在广播前发现，而不是等上链后才知道失败。燃烧币（Burnable=true）gas limit 额外 +2×MinGas，因为合约内部有多步销毁操作。
 
-**监控与 RBF 加速**：广播后监控确认状态，超 30 分钟未确认触发告警；可用 genrbf 工具生成替换交易（同 Nonce 提高 Gas Price），上限 `maxRBFGasP=200`（部分链可配更高），防费用失控。
+第四关是 Nonce 管理，本地缓存严格递增，启动时从 DB 加载记录值不依赖节点状态，Filter 阶段 nonceCache 防并发构建用同一个 Nonce，广播成功后 +1 写回 DB。广播后持续监控确认，超 30 分钟未确认告警，可用 genrbf 工具同 Nonce 提高 Gas Price 做 RBF 加速，上限 maxRBFGasP=200。
 
 ---
 
@@ -160,7 +186,15 @@ flowchart TD
     note1["Gas 动态阈值\n≤10Gwei → 补 0.006ETH\n≤50Gwei → 补 0.01ETH\n>50Gwei  → 补 0.1ETH"]
 ```
 
-归集是四步流水线：Retrieve 先查哪些地址余额超了阈值；Filter 做安全检查，SafeHeight 保证只归集已确认的充值，如果地址还有 Pending 充值在途就先跳过，UnsafeCollect 开关默认关闭；Build 构建转账交易；Fee 处理补 Gas 的情况——ERC20 归集需要地址上有主币支付 Gas，没有就先补一笔，补多少动态计算，Gas 贵的时候多补，防止补 Gas 交易本身卡住。
+归集是四步 channel 流水线，每步独立 goroutine 通过 channel 串联，全程 context 控制取消。
+
+Retrieve 这步先优先拉 Token 列表，再拉主币——代码里就是先遍历 chain.Token()，再查主币，所以 ERC20 归集比主币归集优先触发。每个 Token 独立配置 Collectable 阈值，只有余额超阈值的地址才返回，每次最多 150 条分批。disabled.Aggregation 可以给单个 Token 关掉归集开关不影响其他 Token。
+
+Filter 做安全检查。先查 SafeHeight，保证只对安全高度以下已确认的充值做归集。然后每个地址查两件事：HasPendingInbound（有未确认充值在途）和 AnyPendingSystemtx（有归集单或补费单在途），任一有就跳过，防止归集和充值确认时序冲突以及同一地址 Nonce 冲突。notPending / isPending 两个 map 做本地缓存，同一地址只查一次 DB。Token 还有 MaxColl 上限配置，超出上限只归集上限量，防止单次归集量过大。
+
+Build 是核心，ERC20 和主币处理路径不同。ERC20 归集先查这个地址当前的主币余额（RealTimeBalance），因为 ERC20 transfer 的 tx.value=0，data=ABI.encode(transfer(热钱包地址, amount))，但发交易需要主币支付 Gas。预估 Gas 后算 costFee = gasLimit × gasPrice，如果 costFee > AddrEther 就把这个地址发到补 Gas 队列（fchan），先不归集 Token，等补完 Gas 再说。燃烧币（TokenFeeWithoutEvent）归集时 gas limit 额外 +2×MinGas，因为合约内部有销毁操作，不多加容易 OOG。主币归集更直接，转主币剩余量到热钱包，但如果同一地址同时有 ERC20 归集，归集主币时要先把 ERC20 那笔预留的 Gas 费扣掉，AddrEtherCache 维护了这个减法。
+
+补 Gas 金额动态计算：Gas Price ≤10Gwei 补 0.006 ETH，≤50Gwei 补 0.01 ETH，>50Gwei 补 0.1 ETH，Gas 越贵补越多，防止补进去的 Gas 又被高 Gas 费吃掉还不够用。
 
 ---
 
@@ -187,13 +221,11 @@ flowchart TD
     P --> Q[跑对账验证数据一致性]
 ```
 
-重组检测和回滚分三个阶段：
+每扫到新块，第一件事是拿新块的 parentHash 和本地 DB 里存的上一块 hash 精确比对，不一致说明链发生了分叉，立刻停止处理新块进入回滚流程。
 
-**分叉检测**：每扫到新块，拿新块的 `parentHash` 和本地 DB 里存的上一块 `hash` 精确比对。不一致说明链发生了分叉，立刻停止处理新块，进入回滚流程。
+系统维护 [Front, Back] 滑动窗口，Back 每扫一个新块 +1，Front 是安全高度（每当充值达到确认数 Front++）。回滚从 Back 往 Front 方向逐块走，每块执行 7 步原子事务：① revertBalance 恢复余额 → ② revertInboundTx 删充值记录 → ③ revertOutboundTx 提现回 Pending → ④ revertSystemTx 系统交易回 Pending → ⑤ revertHeader 删区块头 → ⑥ revertHeight 更新 Front/Back → ⑦ revertUTXO 恢复 UTXO 状态（UTXO 链专用）。7 步全部在一个 DB 事务里提交，要么全成功要么全回滚，不会出现中间状态。
 
-**滑动窗口维护**：系统维护 `[Front, Back]` 窗口——`Back` 每扫一个新块 +1，`Front` 是安全高度（每当 Mint 确认一块充值时 Front++）。`Back - Front` 就是当前未确认的块数。回滚从 `Back` 往 `Front` 方向逐块走，每块执行 7 步原子事务：① revertBalance 恢复余额 → ② revertInboundTx 删充值记录 → ③ revertOutboundTx 提现回 Pending → ④ revertSystemTx 系统交易回 Pending → ⑤ revertHeader 删区块头 → ⑥ revertHeight 更新 Front/Back → ⑦ revertUTXO 恢复 UTXO 状态。全部在单事务里，要么全成功要么全回滚，不会出现中间状态。
-
-**深度重组检测**：当 `Front == Back` 时，说明连安全区都被重组了，超出了系统自动处理能力——自动暂停同步，发 Lark 紧急告警，等人工介入评估影响范围、协调交易所撤销已上账充值、手工回滚数据库。回滚完成后跑对账验证链上链下余额一致，才恢复同步。
+当 Front == Back 时，说明连安全区都被分叉覆盖了，超出系统自动处理能力，自动暂停同步，发 Lark 紧急告警，等人工介入评估已上账充值是否需要协调交易所撤销，逐步恢复数据后跑对账验证一致性才重启同步。Polygon 2022 年真实发生过深度分叉，我们事后把 Polygon 确认数调到了 400，这个数字背后是真实教训。
 
 ---
 
@@ -213,13 +245,13 @@ flowchart TD
     I -->|新差值 >= 旧差值 差异扩大| K[紧急告警\n立即处理]
 ```
 
-对账每 2 秒一次，实时对账，不是批量任务。分三步：
+对账每 2 秒跑一次，实时的，不是批量定时任务。
 
-**高度差检查（防误报）**：先比较节点报告的链上最新高度和本地同步高度，差值超过 `hvalue`（可配，默认若干块）说明节点数据不可信，直接跳过这轮对账——避免把节点落后问题误报成余额异常。高度差正常才继续。
+每轮先做高度差检查：比较节点报告的链上最新高度和本地同步高度，差值超过 hvalue（可配）就跳过这轮，节点数据不可信不做对账，防止把节点落后误报成余额异常。高度差正常才往下走。
 
-**余额差计算与阈值告警**：读取本地余额快照（syncer 同步时维护），RPC 查链上当前余额，计算 `diff = chainBalance - localBalance`。`|diff| > dvalue`（可配余额差阈值，按 Token 独立配置）才触发告警，小额误差（Gas 费、精度差）不告警。
+读本地余额快照（syncer 同步时维护在 DB），RPC 查链上余额，算 diff = 链上余额 - 本地余额，绝对值超过 dvalue 阈值（按 Token 独立配置）才触发告警，Gas 费微小误差不告警。
 
-**单调性判断（区分正常延迟 vs 真实异常）**：记录上一次的差值 `prevDiff`，比较新 `newDiff`：`newDiff < prevDiff` 说明差值在收敛，可能是 Pending 交易还未确认，告警级别较低；`newDiff >= prevDiff` 说明差值持续扩大，是真正异常，触发紧急告警立即处理。两种情况区别对待，不一刀切，防止正常确认延迟触发大量误报把真实告警淹没。
+关键是单调性判断：记录上一轮 prevDiff，和这轮 newDiff 比较。newDiff < prevDiff 说明差值在收敛，可能是 Pending 交易还没被确认进账，级别低的告警；newDiff >= prevDiff 说明差值在持续扩大，是真正的异常，紧急告警立刻处理。两种情况如果一刀切统一告警，正常的处理延迟会淹没真实告警，所以要区分开来。
 
 ---
 
@@ -249,7 +281,7 @@ flowchart TD
     H -->|全部匹配| K[通知交易所上账]
 ```
 
-7 层防线是充值安全的核心。最开始是 Status 检查，失败交易直接丢；然后解析 Transfer 事件日志，校验签名哈希、Topics 格式、金额；再对比合约地址白名单——精确地址匹配，不是看 symbol 字符串，假 USDT 合约在这里就被拦住了；然后检查 receipt 的 BlockHash 一致性；对于主币内部转账还要走 Trace 验证；再做交易分类，充值必须是 External→Internal 方向；最后在通知交易所前还有一次二次校验，重新拉交易逐字段比对。全部 7 层都过了才上账。
+7 层防线是充值安全的核心，每层是独立的拦截点，全部过了才上账。第一层 Receipt.Status 检查，0x0 直接丢，这是最基础的门。第二层解析 ERC20 Transfer 事件日志：log.Removed 必须 false（重组撤销的日志不算），Topics[0] 必须是 Transfer 事件签名 0xddf252ad...，Topics 长度必须 3，格式错误直接丢。第三层是 Token 合约地址白名单，精确地址匹配不是 symbol 字符串匹配，假 USDT 合约地址不在白名单，在这层直接拦住，不会产生任何充值记录。第四层是 Receipt BlockHash 一致性校验，receipt.BlockHash 和 header.Hash 对不上，切备用公开节点重新验证。第五层是内部交易 Trace 验证，主币内部转账用 debug_traceTransaction 解析调用树，主调用失败整个作废，子调用失败跳过子树，callType 必须是 call 且 value>0 才算有效转账。第六层是交易分类过滤，充值必须是 External→Internal 方向，Unknown→Unknown 直接过滤。第七层是通知交易所前最后的 verifytx 二次校验，独立从另一个 RPC 节点重新拉交易，逐字段比对 to / symbol / IsSuccess / 金额，FuzzyCompare 处理手续费微小差异，失败按配置走 IgnoreDeposit 或 LarkAlarm。
 
 ---
 
@@ -287,15 +319,15 @@ flowchart TD
     end
 ```
 
-ksrv 和钱包服务是完全分离的两个进程，**私钥的每一次使用都在 ksrv 进程内部完成**：
+ksrv 和钱包服务是完全分离的两个进程，私钥的每一次使用都在 ksrv 进程内部完成。
 
-**存储层**：主种子用 Scrypt（N=2^18，每次 KDF 需要 256MB 内存）加 AES-128-CTR 加密落盘，SHA3-256 MAC 防篡改。启动时运维输入 passphrase，Scrypt 现算密钥解密主种子进内存，立刻用 XOR Mask 掩码保护（主种子 XOR 随机 mask 存两块，需要用时临时还原），明文不常驻内存。
+存储层：主种子用 Scrypt（N=2^18，每次 KDF 需要 256MB 内存，抗 ASIC 暴力破解）加 AES-128-CTR 加密落盘，SHA3-256 MAC 防篡改。启动时运维输入 passphrase，Scrypt 现算密钥解密主种子进内存，立刻用 XOR Mask 掩码保护——主种子 XOR 随机 mask 分成两块分别存，需要用时临时还原，用完立刻清零，明文不常驻内存。
 
-**签名层（核心）**：钱包进程只发 `SignRequest{txHash, chainID, derivePath}`，通过 gRPC mTLS 双向认证（双方各持证书，互相验证）建立安全信道；ksrv 内部用 BIP32 SLIP-0010 硬化路径派生对应子私钥，用 secp256k1 + EIP-155 完成签名，子私钥四步内存清除（0x00→0xFF→随机→0x00，防编译器优化掉清零操作），只把 65 字节签名结果通过 gRPC TLS 传回。**私钥从不离开 ksrv 进程**。
+签名层是核心：钱包只发 SignRequest{txHash, chainID, derivePath}，通过 gRPC mTLS 双向认证建立安全信道（双方各持证书互相验证）；ksrv 内部用 BIP32 SLIP-0010 硬化路径派生对应子私钥，secp256k1 + EIP-155 完成签名，子私钥四步内存清除（0x00→0xFF→随机→0x00，+runtime.KeepAlive 防编译器优化掉清零操作），只把 65 字节签名结果通过 gRPC TLS 传回。私钥从不离开 ksrv 进程。
 
-**验证层**：钱包收到签名后调 `VerifySignature` 检验签名是否对自己构建的那笔交易有效，无效则告警拒绝广播，有效才广播。这一步防止 ksrv 被攻击者操控签出非预期交易。
+钱包收到签名后调 VerifySignature 验证签名是否对自己构建的那笔交易有效，无效告警拒绝广播，防止 ksrv 被攻击者控制后签出非预期交易。
 
-**地址派生**：新用户注册时，钱包用 UID 作为 BIP32 hardened index 请求 `GetHDKey`，ksrv 只返回公钥（子私钥派生后立即清零），地址入库时附带 ksrv 的 Ed25519 签名（绑定 uid+coin+address），每次查地址都验签，防止 DB 被篡改后充值打到攻击者地址。
+地址派生：新用户注册时，钱包用 UID 作为 BIP32 hardened index 请求 GetHDKey，ksrv 只返回公钥（子私钥派生后立即清零），地址入库时附 ksrv 的 Ed25519 签名（绑定 uid+coin+address），每次查地址都验签，防止 DB 被篡改后充值打到攻击者地址。
 
 ---
 
