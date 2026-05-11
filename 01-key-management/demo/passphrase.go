@@ -38,31 +38,42 @@ type CipherParams struct {
 	IV string `json:"iv"`
 }
 
-// EncryptData 加密数据。scryptN 生产用 StandardScryptN，测试用 LightScryptN。
+// EncryptData 用 passphrase 加密 data，兼容以太坊 Web3 Secret Storage 规范。
+// scryptN 生产用 StandardScryptN（256MB内存，抗暴力破解），测试用 LightScryptN（快速）。
 func EncryptData(data, passphrase []byte, scryptN, scryptP int) (CryptoJSON, error) {
+	// 每次加密生成随机 32 字节 salt，防止相同 passphrase 产生相同派生密钥
 	salt := make([]byte, 32)
 	if _, err := rand.Read(salt); err != nil {
 		return CryptoJSON{}, fmt.Errorf("passphrase: generate salt: %w", err)
 	}
 
+	// Scrypt KDF：将 passphrase 转换为 32 字节强密钥
+	// N=2^18 要求 256MB 内存，暴力破解每次尝试都需要大量内存，大幅提高攻击成本
 	derivedKey, err := scrypt.Key(passphrase, salt, scryptN, scryptR, scryptP, scryptDKLen)
 	if err != nil {
 		return CryptoJSON{}, fmt.Errorf("passphrase: scrypt: %w", err)
 	}
-	defer clearBytes(derivedKey)
+	defer clearBytes(derivedKey) // 函数返回前清零派生密钥，避免残留在内存
 
-	iv := make([]byte, aes.BlockSize)
+	// AES-CTR 需要随机 IV（初始向量），每次加密不同，确保相同明文产生不同密文
+	iv := make([]byte, aes.BlockSize) // 16 字节
 	if _, err := rand.Read(iv); err != nil {
 		return CryptoJSON{}, fmt.Errorf("passphrase: generate iv: %w", err)
 	}
 
+	// 用派生密钥的前 16 字节做 AES-128-CTR 加密（CTR 模式把分组密码变成流密码）
 	ciphertext, err := aesCTRXOR(derivedKey[:16], data, iv)
 	if err != nil {
 		return CryptoJSON{}, fmt.Errorf("passphrase: encrypt: %w", err)
 	}
 
+	// 用派生密钥的后 16 字节计算 MAC（SHA3-256(key[16:32] || ciphertext)）
+	// 解密前先验 MAC，不对则说明密码错误或密文被篡改，拒绝解密
 	mac := calculateMAC(derivedKey[16:32], ciphertext)
 
+	// 返回兼容 Web3 Keystore V3 格式的结构：
+	// KDFParams 明文存储（salt/n/r/p），供解密时重新跑 Scrypt 推导同一把密钥
+	// MAC 用于解密后的完整性校验
 	return CryptoJSON{
 		Cipher:     "aes-128-ctr",
 		CipherText: hex.EncodeToString(ciphertext),
@@ -75,7 +86,7 @@ func EncryptData(data, passphrase []byte, scryptN, scryptP int) (CryptoJSON, err
 			"r":     scryptR,
 			"p":     scryptP,
 			"dklen": scryptDKLen,
-			"salt":  hex.EncodeToString(salt),
+			"salt":  hex.EncodeToString(salt), // salt 明文存储，解密时用来重新跑 Scrypt
 		},
 		MAC: hex.EncodeToString(mac),
 	}, nil

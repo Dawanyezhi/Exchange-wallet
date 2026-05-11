@@ -25,17 +25,21 @@
    → SELECT next_index FROM keyman_derivation_counter FOR UPDATE
    → maskedKey.Reveal → BIP32 硬化派生 m/fnv1a(chain)'/index'
    → 提取公钥+地址 → 清零子密钥
+   → Ed25519 签名 proto.Marshal({uid, coin, address}) → addrSig
    → INSERT INTO keyman_derived_addresses（存公钥，不存私钥）
    → UPDATE keyman_derivation_counter SET next_index++
-   → 返回地址+公钥给 Wallet 服务
+   → 返回地址+公钥+addrSig 给 Wallet 服务（Wallet 服务将 addrSig 存入 DB）
+   （后续每次查询该地址时 Wallet 服务用 Keyman 公钥验签，防止 DB 被篡改后充值重定向）
 
 4. 签名（提现/归集时）
-   Wallet 服务 →(X25519加密)→ Keyman POST /keyman/sign
+   Wallet 服务 构建原始交易 → EIP-155 RLP 编码 → 取哈希
+   Wallet 服务 →(X25519+AES-GCM 加密请求)→ Keyman POST /keyman/sign
    → Ed25519 验签 + 时间戳窗口防重放
    → (chain, address) 查内存缓存得 account_index
-   → maskedKey.Reveal → BIP32 派生子密钥 → ECDSA 签名 → 清零子密钥
+   → maskedKey.Reveal → BIP32 派生子私钥 → ECDSA 签名哈希 → 清零子私钥
    → INSERT INTO keyman_sign_audit（审计日志）
-   → 返回签名（65字节 [r||s||v]）
+   → 签名结果（65字节 [r||s||v]）→(X25519+AES-GCM 加密响应)→ 返回 Wallet 服务
+   Wallet 服务 解密 → 拼装完整签名交易 → eth_sendRawTransaction 广播
 
 5. 服务关闭
    SIGTERM → 四步清零内存中所有密钥材料（0x00→0xFF→random→0x00）

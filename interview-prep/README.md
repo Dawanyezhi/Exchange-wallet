@@ -184,7 +184,7 @@ Solana 的结构和 EVM 完全不同。SOL 原生币转账在 SystemProgram.Tran
 
 地址匹配用布隆过滤器先快速筛（百万地址规模 O(1)，只有假阳性无假阴性），命中了再精确查 DB，没命中直接跳过。匹配到就写 inboundtx 表，状态 Pending，记 txid / from / to / amount / blockHeight。
 
-之后进入等待确认阶段，[Front, Back] 滑动窗口计数，到达配置的确认数（BSC=20，Polygon=400——这些数字是根据各链历史分叉深度单独配的，Polygon 400 是 2022 年真实深度分叉后调上去的），Front++ 推进安全高度，触发 verifytx 二次校验。二次校验从另一个独立 RPC 节点重新拉这笔交易，逐字段比对 to / symbol / IsSuccess / 金额（FuzzyCompare 处理微小差异）。校验通过后把 {symbol, txid, to+tag, amount} 序列化成 proto，用 KMS 私钥签名，随充值记录推 MQ 通知交易所上账；校验失败按配置走 IgnoreDeposit（不上账 + 告警）或 LarkAlarm（告警但上账）。
+之后进入等待确认阶段。系统维护 [Front, Back] 滑动窗口：Back 是当前扫到的块高，每扫一块 +1；Front 是安全高度，每当一笔充值到达所需确认数时 Front 往前推一步。到达配置的确认数（BSC=20，Polygon=400——这些数字是根据各链历史分叉深度单独配的，Polygon 400 是 2022 年真实深度分叉后调上去的），触发 verifytx 二次校验。二次校验从另一个独立 RPC 节点重新拉这笔交易，逐字段比对 to / symbol / IsSuccess / 金额（金额比对允许 wei 级别的微小误差，处理因手续费精度导致的轻微差值）。校验通过后把 {symbol, txid, to+tag, amount} 序列化成 proto，用 KMS 私钥签名，随充值记录推 MQ 通知交易所上账；校验失败按配置走 IgnoreDeposit（不上账 + 告警）或 LarkAlarm（告警但上账）。
 
 ---
 
@@ -217,9 +217,9 @@ flowchart TD
 
 第三关是 ksrv 远程签名。钱包只发 SignRequest{txHash, chainID, derivePath} 通过 gRPC mTLS，ksrv 内部 BIP32 SLIP-0010 硬化路径派生子私钥，secp256k1 + EIP-155 签名，签完四步清零子私钥，只返回 65 字节签名结果。钱包收到后调 VerifySignature 验签，确认签出的确实是自己构建的那笔交易，无效告警拒绝广播，这一步防止 ksrv 被攻击者控制后签出非预期交易。
 
-ERC20 提现有额外的注意点：tx.value=0，data 是 ABI 编码的 transfer(to_addr, amount)，tx.to 是合约地址不是用户地址。构建时先 EstimateGas 预估 gas limit，再 CallContract 干调用一次验证合约不会 revert——有些问题合约不抛异常而是静默返回 false，预检能在广播前发现，而不是等上链后才知道失败。燃烧币（Burnable=true）gas limit 额外 +2×MinGas，因为合约内部有多步销毁操作。
+ERC20 提现有额外的注意点：tx.value=0，data 是 ABI 编码的 transfer(to_addr, amount)，tx.to 是合约地址不是用户地址。构建时先 EstimateGas 预估 gas limit，再 CallContract 干调用一次验证合约不会 revert——有些问题合约不抛异常而是静默返回 false，预检能在广播前发现，而不是等上链后才知道失败。燃烧币（Burnable=true）gas limit 额外 +2 倍最小 Gas 增量常量（代码里命名 MinGas），因为合约内部有多步销毁操作，不多留容易 out-of-gas。
 
-第四关是 Nonce 管理，本地缓存严格递增，启动时从 DB 加载记录值不依赖节点状态，Filter 阶段 nonceCache 防并发构建用同一个 Nonce，广播成功后 +1 写回 DB。广播后持续监控确认，超 30 分钟未确认告警，可用 genrbf 工具同 Nonce 提高 Gas Price 做 RBF 加速，上限 maxRBFGasP=200。
+第四关是 Nonce 管理，本地缓存严格递增，启动时从 DB 加载记录值不依赖节点状态，Filter 阶段内存 Nonce 缓存（一个 地址→当前Nonce 的 map，Build 阶段并发跑多个地址时用它防止两笔交易用同一个 Nonce），广播成功后 +1 写回 DB。广播后持续监控确认，超 30 分钟未确认告警，可用 genrbf 工具同 Nonce 提高 Gas Price 做 RBF 加速，上限 maxRBFGasP=200。
 
 **燃烧币（TokenFeeWithoutEvent）提现**：用户要提 100 SafeMoon，系统调 `transfer(userAddr, 100)`，userAddr 实际只收到 95（合约截走 5%）。用户账本必须扣 100，不能只扣 95——否则用户每次提现都能套利（提 100 只扣 95，差额 5 等于白白多了）。但 receipt.Logs 里 Transfer 显示的是 95。解法是读 `tx.input[74:]`——这是 `transfer(to, amount)` 调用里的 amount 参数，是调用方真实填入的 100，用这个值更新账本记录，而不是 log.Data 的 95。
 
@@ -250,13 +250,13 @@ flowchart TD
 
 Retrieve 这步先优先拉 Token 列表，再拉主币——代码里就是先遍历 chain.Token()，再查主币，所以 ERC20 归集比主币归集优先触发。每个 Token 独立配置 Collectable 阈值，只有余额超阈值的地址才返回，每次最多 150 条分批。disabled.Aggregation 可以给单个 Token 关掉归集开关不影响其他 Token。
 
-Filter 做安全检查。先查 SafeHeight，保证只对安全高度以下已确认的充值做归集。然后每个地址查两件事：HasPendingInbound（有未确认充值在途）和 AnyPendingSystemtx（有归集单或补费单在途），任一有就跳过，防止归集和充值确认时序冲突以及同一地址 Nonce 冲突。notPending / isPending 两个 map 做本地缓存，同一地址只查一次 DB。Token 还有 MaxColl 上限配置，超出上限只归集上限量，防止单次归集量过大。
+Filter 做安全检查。先查 SafeHeight，保证只对安全高度以下已确认的充值做归集。然后每个地址查两件事：HasPendingInbound（有未确认充值在途）和 AnyPendingSystemtx（有归集单或补费单在途），任一有就跳过，防止归集和充值确认时序冲突以及同一地址 Nonce 冲突。同一地址只查一次 DB，结果缓存在内存里，不反复查。Token 还有 MaxColl 上限配置，超出上限只归集上限量，防止单次归集量过大。
 
-Build 是核心，ERC20 和主币处理路径不同。ERC20 归集先查这个地址当前的主币余额（RealTimeBalance），因为 ERC20 transfer 的 tx.value=0，data=ABI.encode(transfer(热钱包地址, amount))，但发交易需要主币支付 Gas。预估 Gas 后算 costFee = gasLimit × gasPrice，如果 costFee > AddrEther 就把这个地址发到补 Gas 队列（fchan），先不归集 Token，等补完 Gas 再说。燃烧币（TokenFeeWithoutEvent）归集时 gas limit 额外 +2×MinGas，因为合约内部有销毁操作，不多加容易 OOG。主币归集更直接，转主币剩余量到热钱包，但如果同一地址同时有 ERC20 归集，归集主币时要先把 ERC20 那笔预留的 Gas 费扣掉，AddrEtherCache 维护了这个减法。
+Build 是核心，ERC20 和主币处理路径不同。ERC20 归集先实时查询这个地址的主币余额（调 `eth_getBalance` 拿链上最新值，不用本地快照，防止 Pending 交易导致余额估算偏差），因为 ERC20 transfer 的 tx.value=0，data=ABI.encode(transfer(热钱包地址, amount))，但发交易需要主币支付 Gas。预估 Gas 后算 costFee = gasLimit × gasPrice，如果主币余额不够付 Gas 就把这个地址发到补 Gas 通道（一个专门处理补费请求的 channel），先不归集 Token，等补完 Gas 再说。燃烧币（TokenFeeWithoutEvent）归集时 gas limit 额外 +2 倍最小 Gas 增量常量，因为合约内部有销毁操作，不多加容易 OOG。主币归集更直接，转主币剩余量到热钱包，但如果同一地址同时有 ERC20 归集，归集主币时要先把 ERC20 那笔预留的 Gas 费扣掉——Build 阶段维护一个"地址 → 剩余 ETH"的内存 map，每归集一笔 ERC20 就从里面扣掉对应 Gas 费，处理主币时以 map 里的扣后值为准，防止同一地址的主币把 ERC20 的 Gas 费也抽走了。
 
 补 Gas 金额动态计算：Gas Price ≤10Gwei 补 0.006 ETH，≤50Gwei 补 0.01 ETH，>50Gwei 补 0.1 ETH，Gas 越贵补越多，防止补进去的 Gas 又被高 Gas 费吃掉还不够用。
 
-**燃烧币（TokenFeeWithoutEvent）归集**：系统把用户充值地址的 100 SafeMoon 归到热钱包，调 `transfer(hotWallet, 100)`，热钱包实际入账 95，5 被合约销毁了。如果账本只记热钱包进了 95、用户地址扣了 100，对账永远差 5。解法：对比 `tx.input[74:]` 的 actualValue（100）和 `log.Data` 的 tval（95），`tval < actualValue` 就额外生成一条 `To=FeeBurnAddress` 的 SimpleTrx 记录销毁量（5）——热钱包入账 95 + 销毁记录 5 = 发出的 100，对账平了。Burnable=true 时 gas limit 额外 +2×MinGas（`IncrGasLimit` 里处理），因为合约内部有销毁操作，不多加容易 OOG。
+**燃烧币（TokenFeeWithoutEvent）归集**：系统把用户充值地址的 100 SafeMoon 归到热钱包，调 `transfer(hotWallet, 100)`，热钱包实际入账 95，5 被合约销毁了。如果账本只记热钱包进了 95、用户地址扣了 100，对账永远差 5。解法：对比 `tx.input[74:]` 的 actualValue（100）和 `log.Data` 的 tval（95），`tval < actualValue` 就额外生成一条 `To="FEE_BURN"` 的 SimpleTrx 记录销毁量（5）——"FEE_BURN" 是代码里的哨兵常量字符串，不是链上真实地址，纯粹用于本地账本标记被合约销毁的部分——热钱包入账 95 + 销毁记录 5 = 发出的 100，对账平了。Burnable=true 时 gas limit 额外 +2 倍最小 Gas 增量常量（`IncrGasLimit` 里处理），因为合约内部有销毁操作，不多加容易 OOG。
 
 **TokenFeeWithTransferEvents 归集**：这种代币 burn fee 有独立的 Transfer 事件（to = address(0) 或 fee 合约），receipt 里有多条 Transfer。归集走 `FilterERC20` 拿全部 Transfer 事件，把发向热钱包的那些累加得到实际到账量，再和 `tx.input[74:]` 的原始量做差，差值同样生成 FEE_BURN 记录。
 
@@ -347,7 +347,7 @@ flowchart TD
     H -->|全部匹配| K[通知交易所上账]
 ```
 
-7 层防线是充值安全的核心，每层是独立的拦截点，全部过了才上账。第一层 Receipt.Status 检查，0x0 直接丢，这是最基础的门。第二层解析 ERC20 Transfer 事件日志：log.Removed 必须 false（重组撤销的日志不算），Topics[0] 必须是 Transfer 事件签名 0xddf252ad...，Topics 长度必须 3，格式错误直接丢。第三层是 Token 合约地址白名单，精确地址匹配不是 symbol 字符串匹配，假 USDT 合约地址不在白名单，在这层直接拦住，不会产生任何充值记录。第四层是 Receipt BlockHash 一致性校验，receipt.BlockHash 和 header.Hash 对不上，切备用公开节点重新验证。第五层是内部交易 Trace 验证，主币内部转账用 debug_traceTransaction 解析调用树，主调用失败整个作废，子调用失败跳过子树，callType 必须是 call 且 value>0 才算有效转账。第六层是交易分类过滤，充值必须是 External→Internal 方向，Unknown→Unknown 直接过滤。第七层是通知交易所前最后的 verifytx 二次校验，独立从另一个 RPC 节点重新拉交易，逐字段比对 to / symbol / IsSuccess / 金额，FuzzyCompare 处理手续费微小差异，失败按配置走 IgnoreDeposit 或 LarkAlarm。
+7 层防线是充值安全的核心，每层是独立的拦截点，全部过了才上账。第一层 Receipt.Status 检查，0x0 直接丢，这是最基础的门。第二层解析 ERC20 Transfer 事件日志：log.Removed 必须 false（重组撤销的日志不算），Topics[0] 必须是 Transfer 事件签名 0xddf252ad...，Topics 长度必须 3，格式错误直接丢。第三层是 Token 合约地址白名单，精确地址匹配不是 symbol 字符串匹配，假 USDT 合约地址不在白名单，在这层直接拦住，不会产生任何充值记录。第四层是 Receipt BlockHash 一致性校验，receipt.BlockHash 和 header.Hash 对不上，切备用公开节点重新验证。第五层是内部交易 Trace 验证，主币内部转账用 debug_traceTransaction 解析调用树，主调用失败整个作废，子调用失败跳过子树，callType 必须是 call 且 value>0 才算有效转账。第六层是交易分类过滤，充值必须是 External→Internal 方向（External = 外部 EOA 账户发起，Internal = 我们系统内的用户充值地址接收），Unknown→Unknown（发起和接收地址都无法识别）直接过滤。第七层是通知交易所前最后的 verifytx 二次校验，独立从另一个 RPC 节点重新拉交易，逐字段比对 to / symbol / IsSuccess / 金额，FuzzyCompare 处理手续费微小差异，失败按配置走 IgnoreDeposit 或 LarkAlarm。
 
 ---
 
@@ -545,7 +545,7 @@ Fee：ERC20 归集前检查地址有没有主币，没有就补一笔 Gas。补�
 
 Nonce 我们是本地缓存管理，启动时从数据库加载上次记录的 Nonce，不是每次启动都从 RPC 查——这样更快，也不依赖节点状态。每次广播一笔交易就 +1，本地严格维护。workorder 工具处理 RECOVER 等特殊场景时会从 RPC 同步一次 Nonce，日常提现走数据库加载。
 
-关键是严格串行，Filter 阶段有 nonceCache 防止并发构建交易用同一个 Nonce——Nonce 冲突的话矿工只会接受一笔，另一笔就丢了或者被替换。
+关键是严格串行，Filter 阶段有内存 Nonce 缓存防止并发构建交易用同一个 Nonce——Nonce 冲突的话矿工只会接受一笔，另一笔就丢了或者被替换。
 
 Nonce 卡住的情况也处理过——Gas 设太低导致交易一直 pending，后续的 Nonce 都被卡住了。处理方式是用 genrbf 对卡住的那笔做 RBF，提高 Gas Price，让它先确认，后面的队列才能继续动。
 
