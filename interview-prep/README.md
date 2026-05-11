@@ -155,7 +155,19 @@ ERC20 充值（USDT / USDC 等）完全不同，tx.value 是 0，真实金额藏
 }
 ```
 
-解析逻辑：遍历 receipt.Logs，找到 `Topics[0] == 0xddf252ad...` 且 Topics 长度为 3 的日志，`Topics[1][26:]` 截取 from（去掉 32 字节里的 12 字节 zero padding），`Topics[2][26:]` 截取 to，`log.Data` hex 解码得到金额，再核对 `log.Address` 是否在合约白名单里。归一到内部结构：
+拿到原始 JSON 之后，不是直接用，要经过 `FilterERC20()` 里的五道关卡逐条过滤每一个 log：
+
+**关卡 1 — 重组检测**：`if log.Removed` → 链发生重组，这条 log 已被撤销，整个交易直接返回 `NewRetriveWhenForkedError`，不产生任何充值记录。
+
+**关卡 2 — 事件签名**：`len(log.Topics) != 3 || log.Topics[0] != TrasferEvent`（`0xddf252ad...`）→ 不是标准 ERC20 Transfer 事件，`continue` 跳过。一个交易可能有 Approval、Swap 等各种事件，都在这里被过滤掉。
+
+**关卡 3 — 合约白名单**：`c.chain.Contracts(log.Address)` → 合约地址不在配置白名单里，或类型不是 ERC20，`continue` 跳过。假 USDT 合约在这里被拦截。
+
+**关卡 4 — 金额与格式校验**：`bigint.FromHex(log.Data)` 解析金额，如果是零值跳过；再检查 `len(log.Topics[1]) == EventTopicSize && len(log.Topics[2]) == EventTopicSize`（66 字符，即 32 字节 hex）——格式不对的跳过。
+
+**关卡 5 — 提取地址与金额**：前四关都过了，才做实际解析：`sender = "0x" + log.Topics[1][26:]`，`receiver = "0x" + log.Topics[2][26:]`（截掉 32 字节里前 12 字节的零 padding），`tval = bigint.FromHex(log.Data)`。生成 `SimpleTrx{Symbol, From: sender, To: receiver, Value: tval}`。
+
+全部过完，归一到内部结构：
 
 ```go
 MixRetriver{
@@ -163,13 +175,52 @@ MixRetriver{
     Executor: "0xa7d9dd...",  // tx.From，tx.value=0
     IsSuccess: true,
     List: []*SimpleTrx{
-        // from = Topics[1][26:], to = Topics[2][26:], value = log.Data
         {Symbol: "USDT", From: "0xa7d9dd...", To: "0xf02c1c...", Value: bigint(100_000_000)},
     },
 }
 ```
 
-还有一类燃烧币（SafeMoon / BRISE 类），trx.Value != trx.OriginValue，到账金额小于转账金额，差值是合约自动销毁的部分。处理时额外生成一条 To="FEE_BURN" 的 SimpleTrx 记录销毁量，上账只算实际到账的 tval。
+**燃烧币（TokenFeeWithoutEvent / Reflection Token）**的处理要单独说清楚，有两条路径：
+
+**路径 A — 通过 CommonClient 后端的路径（commonsyncer.go）**：后端代理服务做了预处理，交易里会同时带 `Value`（实际到账）和 `OriginValue`（发送方转出量）两个字段。判断逻辑：
+
+```go
+// trx.Value = 实际到账（合约销毁后）  trx.OriginValue = 发送方转出量
+if trx.Value != trx.OriginValue {
+    // 差值就是被合约销毁的部分，单独记一条 FEE_BURN
+    burnValue := new(big.Int).Sub(originValue.Int, value.Int)
+    st = append(st, &SimpleTrx{Symbol: token.CoinName, From: trx.From, To: "FEE_BURN", Value: burnValue})
+}
+// 再记实际到账这一条
+st = append(st, &SimpleTrx{Symbol: token.CoinName, From: trx.From, To: trx.To, Value: value})
+```
+
+主币走主币路径，如果主币 `Value != OriginValue` 直接 error——主币不存在销毁机制，出现这种情况是数据异常。
+
+**路径 B — 直接 RPC 路径（FilterERC20.go）**："TokenFeeWithoutEvent" 的含义是销毁没有独立的 Transfer 事件，receipt.Logs 里只有一条到接收方的 Transfer，log.Data 就是实际到账量，看不出销毁了多少。所以这条路径的识别方式是：token 必须在配置里预先标记为 `coinset.TokenFeeWithoutEvent`，而且只对**系统地址发起的交易**（提现 / 归集）做特殊处理，普通用户充值直接用 log.Data 里的实际到账量上账：
+
+```go
+if c.IsRelectionToken(tokenAddress) && trx.To == tokenAddress {
+    if c.IsSystemAddress(sender) || c.IsSystemAddress(receiver) {
+        // 从 tx.input[74:] 读出原始转账金额（transfer(to, amount) 的 amount 参数）
+        actualValue, _ := bigint.FromHex(trx.Input[74:])
+
+        // 提现场景：系统地址是 sender，tval（log.Data）!= actualValue（input 参数）
+        // → 有部分被销毁，账本应记 actualValue（用户提走的量），而非到账的 tval
+        case c.IsSystemAddress(sender) && tval.Cmp(actualValue.Int) != 0:
+            newTx.Value = actualValue
+
+        // 归集场景：系统地址是 receiver，tval < actualValue
+        // → 实际归到热钱包的是 tval，差值被合约销毁，单独记 FEE_BURN
+        case c.IsSystemAddress(receiver) && tval.Cmp(actualValue.Int) < 0:
+            newTx.Value = actualValue
+            burned := new(big.Int).Sub(actualValue.Int, tval.Int)
+            list = append(list, &SimpleTrx{..., To: FeeBurnAddress, Value: burned})
+    }
+}
+```
+
+两条路径的本质是一样的：用实际到账量记用户账本，用差值记 FEE_BURN，保证账本里每一笔销毁都有记录可以对账。
 
 Solana 的结构和 EVM 完全不同。SOL 原生币转账在 SystemProgram.Transfer 指令里；SPL Token（Solana 上的 USDC/USDT 等）的转账在 TokenProgram.Transfer / TransferChecked 指令里，to 地址是 Associated Token Account（ATA），需要反推出背后的真实持有者地址。一笔 Solana 交易可以包含多个 Instructions，每个可能是一条转账，底层解析方式和 EVM 的 Receipt.Logs 完全不同，但同样归一到 MixRetriver → SimpleTrx 结构，上层 syncer 处理逻辑对链类型透明。
 
