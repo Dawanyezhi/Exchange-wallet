@@ -10,38 +10,45 @@
 
 **2 分钟项目介绍**
 
-我们做的是一套交易所托管钱包系统，由三个服务组成。最核心的设计原则是**密钥和钱包逻辑完全分离**：密钥管理层是独立隔离的进程，即使钱包进程被攻破也尽量减少私钥暴露。
+我们做的是一套交易所托管钱包系统。从部署角度看是**两个核心服务对接交易所**：**钱包服务**负责所有链上操作（扫块/充值/提现/归集/对账），**ksrv** 是独立的签名服务。最核心的设计原则是**密钥和钱包逻辑完全分离**：私钥全生命周期在 ksrv 进程里，即使钱包服务被攻破，攻击者也拿不到私钥。
 
-三个服务各自负责什么（先理解这个，架构图才好看懂）：
+三个角色各自负责什么：
 
-**密钥管理层（ksrv）**：私钥全生命周期都在这里。主种子 Scrypt+AES 加密落盘；钱包进程只发待签名的交易哈希，ksrv 内部完成 BIP32 派生 + 签名，gRPC TLS 传输签名结果，**私钥从不离开 ksrv 进程**。签名后钱包还要验证签名有效性才广播。地址派生以 UID 为 BIP32 hardened index，ksrv 只返回公钥；地址入库时附 Ed25519 签名（绑定 uid+coin+address），防止 DB 被篡改后充值资金被重定向。
+**交易所**：业务方，管用户账本。向钱包服务发提现订单，接收充值确认通知上账。
 
-**irwallet（通用引擎层）**：把三种链类型（UTXO 型 BTC、账户型 ETH、Tag 型 XRP）的公共逻辑全部抽象在这里。内部三个核心模块：syncer 扫块同步 + parentHash 重组检测 + 充值写库；reconciler 每 2 秒对比链上与本地余额，差值持续扩大立刻告警；firefly 管理热钱包，协调归集入账和提现出账。
+**钱包服务**（实际是多个进程，按链类型分）：
+- EVM 链用 **ethfork**，一套代码覆盖 60+ 条 EVM 兼容链（ETH/BSC/Polygon/Arbitrum/zkSync 等），内部有 syncer 扫块+重组检测、wallet 提现执行、collector 归集；链间差异靠 FeatureGate + chaincfg 配置驱动，新增链只加配置文件
+- 非 EVM 链（BTC/XRP/SOL 等）各有独立进程，底层共用 **irwallet** 这个**通用代码库**——irwallet 把 UTXO/Account/Tag 三种链类型的公共逻辑（syncer 扫块+重组检测+充值写库、reconciler 2秒实时对账、firefly 热钱包管理）全部抽象出来，各链实现只需适配链特定的 RPC 调用
+- 所有钱包进程都只发交易哈希给 ksrv，**不持有私钥**
 
-**ethfork（EVM 多链层）**：专门处理 60+ 条 EVM 兼容链（ETH/BSC/Polygon/Arbitrum/zkSync 等）。内部有 syncer（扫块+重组检测）、wallet（提现执行）、collector（归集），链间差异靠 FeatureGate + chaincfg 配置驱动，新增一条 EVM 链只加配置文件，不改核心代码。
+**ksrv**：独立签名服务。主种子 Scrypt+AES 加密落盘；收到交易哈希后，内部完成 BIP32 派生 + 签名，只把签名结果通过 gRPC TLS 传回，**私钥从不离开 ksrv 进程**。
 
 日常业务四件事：充值（确认后 MQ 通知上账）、提现（签名广播）、归集（散币聚到热钱包）、对账（2 秒一次，偏差立即报警）。
 
 ```mermaid
 flowchart TD
-    A[交易所] -->|提现下单 / 充值通知| B
+    A[交易所]
 
-    subgraph irwallet["irwallet 通用钱包引擎"]
-        B[syncer 同步] --> B2[reconciler 对账]
-        B --> B3[firefly 热钱包]
+    subgraph wallet["钱包服务层（多个进程）"]
+        subgraph ethfork["ethfork — EVM 60+ 链"]
+            C[syncer 扫块+重组] --> C2[wallet 提现]
+            C2 --> C3[collector 归集]
+        end
+        subgraph nonEVM["非 EVM 链（BTC/XRP 等）\n共用 irwallet 通用代码库"]
+            B[syncer 扫块+重组] --> B2[reconciler 对账]
+            B --> B3[firefly 热钱包]
+        end
     end
 
-    B -->|EVM 链处理| C
-
-    subgraph ethfork["ethfork EVM 多链钱包 60+链"]
-        C[syncer 扫块] --> C2[wallet 提现]
-        C2 --> C3[collector 归集]
-    end
-
-    subgraph wm["密钥管理层（ksrv gRPC）"]
+    subgraph ksrv["ksrv — 独立签名服务"]
         D[gRPC mTLS 双向认证] --> D2[BIP32 硬化派生子密钥]
         D2 --> D3["内部签名→签名结果\n私钥不离 ksrv 进程"]
     end
+
+    A -->|"提现下单"| C2
+    A -->|"提现下单"| B3
+    B2 -->|"MQ 充值通知"| A
+    C -->|"MQ 充值通知"| A
 
     C2 -->|"交易哈希"| D
     B3 -->|"交易哈希"| D
@@ -50,16 +57,16 @@ flowchart TD
 
     C -->|RPC| E[60+ EVM 链节点]
     B -->|RPC| F[BTC / XRP / SOL 等节点]
-    B2 -->|MQ 通知上账| A
 ```
 
-**三层的分工：**
+**三个角色的分工：**
 
-| 层 | 组件 | 职责 |
+| 角色 | 组件 | 职责 |
 |---|---|---|
-| 密钥管理层 | ksrv | 私钥全生命周期（生成/存储/签名/清零）；私钥永不离开 ksrv 进程；钱包进程只发交易哈希，gRPC TLS 传回签名结果 |
-| 通用引擎层 | irwallet | 三种链类型（UTXO/Account/Tag）公共逻辑抽象；对账、热钱包管理 |
-| EVM 多链层 | ethfork | 60+ 条 EVM 兼容链；配置驱动，新增链只需加配置文件 |
+| 业务方 | 交易所 | 用户账本；下提现单；接收 MQ 充值通知上账 |
+| 钱包服务（EVM） | ethfork | 60+ EVM 链扫块/提现/归集；FeatureGate 配置驱动，新增链只加配置文件 |
+| 钱包服务（非EVM） | irwallet 代码库 + 各链进程 | irwallet 抽象 UTXO/Account/Tag 公共逻辑；btcwallet/dogecoinwallet 等各自独立进程 |
+| 签名服务 | ksrv | 私钥全生命周期；gRPC TLS 传回签名结果，私钥永不离开 ksrv 进程 |
 
 ---
 
@@ -122,7 +129,7 @@ flowchart TD
 
 提现的核心原则是：**私钥永远不在钱包进程里**。整个流程分五关：
 
-**地址校验**：格式检查（正则匹配链地址格式）+ 黑名单匹配。黑名单来自**独立的远程黑名单服务**（HTTP API），本地内存缓存、mutex 保护，后台 goroutine 每分钟定时刷新；HTTP 响应带 Ed25519 签名（由黑名单服务签发，对 `{total, list, timestamp}` 签名），irwallet 验签确保响应未被中间人篡改，同时校验时间戳在 15 秒内防重放，拉到空列表也能验签失败拒绝。任一校验失败拒绝 + Lark 告警。
+**地址校验**：格式检查（正则匹配链地址格式）+ 黑名单匹配。黑名单来自**独立的远程黑名单服务**（HTTP API），本地内存缓存、mutex 保护，后台 goroutine 每分钟定时刷新；HTTP 响应带 Ed25519 签名（由黑名单服务签发，对 `{total, list, timestamp}` 签名），钱包服务验签确保响应未被中间人篡改，同时校验时间戳在 15 秒内防重放，拉到空列表也能验签失败拒绝。任一校验失败拒绝 + Lark 告警。
 
 **余额与 MaxFee 检查**：热钱包余额不足则等待告警；构建完交易后算预估矿工费，和 `maxFeeGwei` 配置比较——Gas Price 超限直接拒绝广播，防止网络拥堵时扛着 200 Gwei 把提现发出去。
 
@@ -380,7 +387,7 @@ RBF 是 UTXO 模型里的机制，交易发出去后如果标记了 RBF 可替�
 
 提现安全主要靠几道关卡串联。
 
-地址校验：格式检查、黑名单匹配。黑名单从独立的远程黑名单服务拉取（HTTP API），本地内存缓存每分钟刷新；响应带 Ed25519 签名，irwallet 验签 + 时间戳校验（15 秒窗口），防止中间人篡改响应或重放旧列表。
+地址校验：格式检查、黑名单匹配。黑名单从独立的远程黑名单服务拉取（HTTP API），本地内存缓存每分钟刷新；响应带 Ed25519 签名，钱包服务验签 + 时间戳校验（15 秒窗口），防止中间人篡改响应或重放旧列表。
 
 余额检查：提现前确认热钱包余额够用。
 
@@ -454,15 +461,13 @@ Nonce 卡住的情况也处理过——Gas 设太低导致交易一直 pending�
 
 **回答**：
 
-我们把链抽象成三种类型：UTXO 型（BTC、LTC）、账户型（ETH、TRON）、Tag 型（XRP、XLM，需要 memo 标签区分用户）。irwallet 这层把这三种的公共逻辑都抽象了。
+我们把链抽象成三种类型：UTXO 型（BTC、LTC）、账户型（ETH、TRON）、Tag 型（XRP、XLM，需要 memo 标签区分用户）。irwallet 是一个**通用代码库**，把这三种类型的公共逻辑（扫块、重组检测、充值写库、对账、热钱包）全部抽象出来，各链的钱包进程引用它、适配链特定的 RPC 调用，不需要重复实现核心逻辑。
 
-EVM 链这边用 ethfork 统一处理，支持 60+ 条链，差异用 FeatureGate 控制——有些链需要特殊的 Gas 计算、有些链用 Secp256r1 签名（ABIoT）、有些链从浏览器 API 拉内部交易（SGB/Flare）。
-
-每条链的确认数、Gas 参数、签名算法、RPC 节点都在 chaincfg 里独立配置，配置驱动，新增一条 EVM 链基本就是加配置文件，不需要改核心代码。
+EVM 链统一用 ethfork 一个服务搞定，支持 60+ 条链，链间差异用 FeatureGate 控制——有些链需要特殊 Gas 计算、有些用 Secp256r1 签名（ABIoT）、有些从浏览器 API 拉内部交易（SGB/Flare）。每条链的确认数、Gas 参数、签名算法、RPC 节点都在 chaincfg 里独立配置，新增一条 EVM 链基本就是加配置文件，不需要改核心代码。
 
 **如果追问**：新增一条链要做什么？
 
-如果是 EVM 链，就在 chaincfg 里加配置：确认数、chainID、Gas 参数、RPC 节点、特性开关。然后部署节点，做一次充值提现测试，validator 启动时会链上验证 Token 配置是否正确。如果是非 EVM 链，要在 irwallet 里实现对应的同步器和签名逻辑，工作量大一些。
+如果是 EVM 链，就在 chaincfg 里加配置：确认数、chainID、Gas 参数、RPC 节点、特性开关。然后部署节点，做一次充值提现测试，validator 启动时会链上验证 Token 配置是否正确。如果是非 EVM 链，要基于 irwallet 代码库实现对应链的 RPC 适配、签名逻辑，打包成独立进程部署，工作量大一些。
 
 ---
 
@@ -1106,7 +1111,7 @@ MPC 门限签名（TSS）：完全在链下完成协议，链上看到的是普�
 
 - "假 Token 攻击我们是用合约地址精确白名单匹配来防的，不是只看 symbol 字符串。攻击者可以部署一个 symbol 也叫 USDT 的假合约，但合约地址对不上，Transfer 事件在扫块阶段就被过滤掉了，根本不产生充值记录。"
 - "EIP-155 把 chainID 编进签名，这对多链钱包来说是强制项。我们跑 60+ 条链，如果不做，一条链的提现签名可以在另一条链上重放，损失成倍扩大。"
-- "黑名单不是存本地数据库的，是从独立的远程黑名单服务 HTTP API 拉取，本地内存缓存每分钟刷新。服务端在响应里附 Ed25519 签名（对 list+total+timestamp 的签名），irwallet 验签 + 15 秒时间戳窗口防重放，确保拿到的列表没被中间人替换成空列表把所有地址都放行。"
+- "黑名单不是存本地数据库的，是从独立的远程黑名单服务 HTTP API 拉取，本地内存缓存每分钟刷新。服务端在响应里附 Ed25519 签名（对 list+total+timestamp 的签名），钱包服务验签 + 15 秒时间戳窗口防重放，确保拿到的列表没被中间人替换成空列表把所有地址都放行。"
 
 **运维经验方向：**
 
