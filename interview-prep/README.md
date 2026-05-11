@@ -155,19 +155,13 @@ ERC20 充值（USDT / USDC 等）完全不同，tx.value 是 0，真实金额藏
 }
 ```
 
-拿到原始 JSON 之后，不是直接用，要经过 `FilterERC20()` 里的五道关卡逐条过滤每一个 log：
+这两份数据不是一次 RPC 拿到的。`eth_getTransactionByHash` 只返回交易体（from/to/value/input），**不包含执行结果**——交易成功还是失败、产生了哪些日志，都在 `eth_getTransactionReceipt` 里。两次 RPC 缺一不可。
 
-**关卡 1 — 重组检测**：`if log.Removed` → 链发生重组，这条 log 已被撤销，整个交易直接返回 `NewRetriveWhenForkedError`，不产生任何充值记录。
+拿到 receipt 之后先检查 `receipt.status`。`0x0` 代表失败，EVM 执行触发了 revert，所有状态变更全部回滚，logs 也被清空（失败的交易不产生任何 Transfer 事件）。绝大多数情况直接跳过，但有一个例外：如果是我们系统地址（热钱包 / 归集地址）发起的提现或归集失败了，还是要记录一条 `Failed: true` 的 SimpleTrx——否则这笔失败的系统交易在对账时就变成了"无缘无故消失的手续费"。
 
-**关卡 2 — 事件签名**：`len(log.Topics) != 3 || log.Topics[0] != TrasferEvent`（`0xddf252ad...`）→ 不是标准 ERC20 Transfer 事件，`continue` 跳过。一个交易可能有 Approval、Swap 等各种事件，都在这里被过滤掉。
+`status == 0x1` 之后，还需要做 `receipt.blockHash` 和当前处理 header 的 hash 比对，防止拿到了不属于当前块的 receipt（节点数据不一致时可能发生）。
 
-**关卡 3 — 合约白名单**：`c.chain.Contracts(log.Address)` → 合约地址不在配置白名单里，或类型不是 ERC20，`continue` 跳过。假 USDT 合约在这里被拦截。
-
-**关卡 4 — 金额与格式校验**：`bigint.FromHex(log.Data)` 解析金额，如果是零值跳过；再检查 `len(log.Topics[1]) == EventTopicSize && len(log.Topics[2]) == EventTopicSize`（66 字符，即 32 字节 hex）——格式不对的跳过。
-
-**关卡 5 — 提取地址与金额**：前四关都过了，才做实际解析：`sender = "0x" + log.Topics[1][26:]`，`receiver = "0x" + log.Topics[2][26:]`（截掉 32 字节里前 12 字节的零 padding），`tval = bigint.FromHex(log.Data)`。生成 `SimpleTrx{Symbol, From: sender, To: receiver, Value: tval}`。
-
-全部过完，归一到内部结构：
+才进入 `FilterERC20()` 逐条过滤每一个 log。过滤分五步：先检查 `log.Removed`，true 说明链重组这条 log 已撤销，整个交易直接返回重组错误；再检查 `len(log.Topics) != 3 || log.Topics[0] != 0xddf252ad...`，不是标准 Transfer 事件（Approval / Swap / 其他事件）直接 continue 跳过；然后用 `log.Address` 查合约白名单，不在白名单或类型不是 ERC20 跳过（假 USDT 在这里被拦）；接着 `bigint.FromHex(log.Data)` 解析金额，零值跳过，同时验证 Topics[1] / Topics[2] 长度是否等于 EventTopicSize（32 字节 hex = 66 字符），格式不对跳过；五关全过，才做 `sender = "0x" + Topics[1][26:]`，`receiver = "0x" + Topics[2][26:]`（截掉 32 字节里前 12 字节的 zero padding），`tval = log.Data`，生成 SimpleTrx。
 
 ```go
 MixRetriver{
@@ -180,47 +174,29 @@ MixRetriver{
 }
 ```
 
-**燃烧币（TokenFeeWithoutEvent / Reflection Token）**的处理要单独说清楚，有两条路径：
+**燃烧币（Reflection Token / Fee Token）** 是 EVM 代币充值里最麻烦的一类，需要从原理说起。
 
-**路径 A — 通过 CommonClient 后端的路径（commonsyncer.go）**：后端代理服务做了预处理，交易里会同时带 `Value`（实际到账）和 `OriginValue`（发送方转出量）两个字段。判断逻辑：
+**原理**：正常 ERC20 的 `transfer(to, 100)` 就是让 to 得到 100 个 token。Reflection Token（反射 / 通缩代币）在合约里加了税——调 `transfer(to, 100)` 时，合约内部悄悄截走一部分（比如 5%），to 实际只收到 95，被截的 5 进了销毁地址或按比例分给所有持有者。关键在于：**这 5 个被截走的 token 没有独立的 Transfer 事件**，receipt.Logs 里只有一条 Transfer 显示 to 收到了 95，看不到那 5 的去向——这就是 codebase 里命名 `TokenFeeWithoutEvent` 的含义。另一种变体 `TokenFeeWithTransferEvents` 则会在 logs 里额外产生一条 Transfer 到 burn/fee 地址，两者处理方式不同。
 
-```go
-// trx.Value = 实际到账（合约销毁后）  trx.OriginValue = 发送方转出量
-if trx.Value != trx.OriginValue {
-    // 差值就是被合约销毁的部分，单独记一条 FEE_BURN
-    burnValue := new(big.Int).Sub(originValue.Int, value.Int)
-    st = append(st, &SimpleTrx{Symbol: token.CoinName, From: trx.From, To: "FEE_BURN", Value: burnValue})
-}
-// 再记实际到账这一条
-st = append(st, &SimpleTrx{Symbol: token.CoinName, From: trx.From, To: trx.To, Value: value})
-```
+**经典例子**：BSC 链上的 SafeMoon（SAFEMOON）是这类代币的鼻祖，10% 转账税（5% 销毁 + 5% 分红），BRISE（Bitgert 链）同理。BSC 链上大量"BABY" / "FLOKI" 系 BEP20 都是这个模式。代码里 `badERC20` map 里的 TOPC、BAR/ACM/PSG（CHZ 链足球粉丝代币）则是另一类问题：合约 `transfer()` 永远返回 false 即使成功了，不是燃烧机制。
 
-主币走主币路径，如果主币 `Value != OriginValue` 直接 error——主币不存在销毁机制，出现这种情况是数据异常。
+**问题在哪**：
 
-**路径 B — 直接 RPC 路径（FilterERC20.go）**："TokenFeeWithoutEvent" 的含义是销毁没有独立的 Transfer 事件，receipt.Logs 里只有一条到接收方的 Transfer，log.Data 就是实际到账量，看不出销毁了多少。所以这条路径的识别方式是：token 必须在配置里预先标记为 `coinset.TokenFeeWithoutEvent`，而且只对**系统地址发起的交易**（提现 / 归集）做特殊处理，普通用户充值直接用 log.Data 里的实际到账量上账：
+充值（用户发 100 SafeMoon 进来）：receipt.Logs 里 to=用户地址 的 Transfer 显示收到 95，就上账 95，这是正确的——用户存了多少，我们就上多少。
 
-```go
-if c.IsRelectionToken(tokenAddress) && trx.To == tokenAddress {
-    if c.IsSystemAddress(sender) || c.IsSystemAddress(receiver) {
-        // 从 tx.input[74:] 读出原始转账金额（transfer(to, amount) 的 amount 参数）
-        actualValue, _ := bigint.FromHex(trx.Input[74:])
+提现（用户要提走 100 SafeMoon）：系统调 `transfer(userAddr, 100)`，userAddr 只收到 95，但用户账本必须扣 100（用户要求提 100，不能只扣 95，否则用户可以循环套利），receipt.Logs 显示的是 95。
 
-        // 提现场景：系统地址是 sender，tval（log.Data）!= actualValue（input 参数）
-        // → 有部分被销毁，账本应记 actualValue（用户提走的量），而非到账的 tval
-        case c.IsSystemAddress(sender) && tval.Cmp(actualValue.Int) != 0:
-            newTx.Value = actualValue
+归集（把用户充值地址的 SafeMoon 归到热钱包）：系统调 `transfer(hotWallet, 100)`，热钱包实际进账 95，这 5 被销毁了。如果账本只记热钱包进了 95 但扣了用户地址 100，对账永远差 5。
 
-        // 归集场景：系统地址是 receiver，tval < actualValue
-        // → 实际归到热钱包的是 tval，差值被合约销毁，单独记 FEE_BURN
-        case c.IsSystemAddress(receiver) && tval.Cmp(actualValue.Int) < 0:
-            newTx.Value = actualValue
-            burned := new(big.Int).Sub(actualValue.Int, tval.Int)
-            list = append(list, &SimpleTrx{..., To: FeeBurnAddress, Value: burned})
-    }
-}
-```
+**解法**：提现和归集需要知道"原始 input 金额"。`tx.input` 里的 `transfer(to, amount)` 的 `amount` 参数就是调用方填进去的，截取 `trx.Input[74:]` 就能拿到——这个是"发出去多少"，log.Data 是"收到多少"，两者之差是被销毁的部分。
 
-两条路径的本质是一样的：用实际到账量记用户账本，用差值记 FEE_BURN，保证账本里每一笔销毁都有记录可以对账。
+充值路径不需要特殊处理（只有系统地址才触发特殊逻辑）。提现路径：`tval(log.Data) != actualValue(input[74:])` 时把账本记录更新为 actualValue，保证用户扣的是提走的原始量。归集路径：`tval < actualValue` 时额外生成一条 `To=FeeBurnAddress` 的 SimpleTrx，记录销毁量，热钱包入账 tval，销毁记 burned，总和等于 actualValue，对账不会出差。
+
+对于 `TokenFeeWithTransferEvents`（如某些 fee-on-transfer token，burn 有独立 event）：提现时直接用 `tx.input[74:]` 的 amount 上账（不依赖 logs），归集时则先走 `FilterERC20` 拿所有 Transfer 事件，把系统地址的入账累加后和 input amount 比，差值同样记 FEE_BURN。
+
+对于 `badERC20`（TOPC、CHZ 链足球代币 BAR/ACM/PSG 等）：问题不在充值，在提现构建时——`CallContract` 预检会拿到 false 返回值，正常逻辑会以为 transfer 会失败而拒绝广播。解法是把这些 token 配置进 `badERC20` map，设 `NoResCheck=true`，跳过返回值检查。充值解析逻辑完全不受影响，因为充值看的是 receipt.Logs，不是 callContract 的返回值。
+
+这几类特殊 token 对 **对账** 的影响：FEE_BURN 记录的存在让每笔燃烧都有账可查，reconciler 比对链上余额和本地账本时不会出现系统性偏差。如果没有 FEE_BURN，每归集一笔 SafeMoon 热钱包就会少 5%，对账永远报警。
 
 Solana 的结构和 EVM 完全不同。SOL 原生币转账在 SystemProgram.Transfer 指令里；SPL Token（Solana 上的 USDC/USDT 等）的转账在 TokenProgram.Transfer / TransferChecked 指令里，to 地址是 Associated Token Account（ATA），需要反推出背后的真实持有者地址。一笔 Solana 交易可以包含多个 Instructions，每个可能是一条转账，底层解析方式和 EVM 的 Receipt.Logs 完全不同，但同样归一到 MixRetriver → SimpleTrx 结构，上层 syncer 处理逻辑对链类型透明。
 
