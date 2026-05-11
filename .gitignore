@@ -1,0 +1,41 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/bin/
+/wallet
+/keyman
+/simulate
+
+# Test binary
+*.test
+
+# Go build cache
+/vendor/
+
+# Environment files
+.env
+*.env.local
+config/*-prod.yaml
+config/*-stage.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Keystore files (never commit real keys)
+keystore/*.json
+!keystore/example.json
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
+CLAUDE.md

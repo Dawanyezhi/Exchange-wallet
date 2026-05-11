@@ -1,0 +1,49 @@
+# 密钥管理服务开发环境配置
+# 注意：私钥/助记词等敏感数据在生产环境中通过 HSM 或 KMS 管理，绝对不能明文写入文件
+
+keyman:
+  # 服务监听地址（仅内网，不对外暴露）
+  listen_addr: "127.0.0.1:9000"
+
+  # BIP32 主密钥加密存储路径（使用 Scrypt+AES-128-CTR 加密）
+  keystore_path: "/data/keyman/keystore"
+
+  # 密钥派生方案
+  derivation:
+    # irwallet 模式：用 FNV-1a(coin) 代替 BIP44 coin type，支持任意链
+    coin_index_method: "fnv1a"   # "fnv1a" | "bip44"
+    hardened: true               # 强制使用硬化路径（m/coin'/account'）
+
+  # Scrypt 参数（生产用 standard，测试用 light）
+  scrypt:
+    n: 262144   # StandardScryptN = 1 << 18
+    r: 8
+    p: 1
+
+  # X25519 传输加密（钱包服务 → 密钥服务的加密通道）
+  transport:
+    # 每次请求使用临时密钥对，提供前向保密
+    ephemeral: true
+    # 密钥服务的公钥（用于加密发送给密钥服务的签名请求）
+    server_public_key: ""   # 生产中从 KMS 获取，禁止硬编码
+
+  # 签名服务 gRPC 端点（生产中运行在隔离网络）
+  signer_endpoint: "127.0.0.1:9001"
+
+  # 密钥轮换策略
+  rotation:
+    enabled: false
+    interval_days: 90
+
+db:
+  host: "127.0.0.1"
+  port: 3306
+  name: "wallet_keyman_dev"
+  user: "wallet"
+  password: ""   # 开发环境空密码，生产环境从 Vault 获取
+  max_open: 10
+  max_idle: 5
+
+log:
+  level: "debug"
+  format: "text"

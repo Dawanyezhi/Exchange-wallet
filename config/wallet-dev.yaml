@@ -1,0 +1,44 @@
+# exchange-wallet 开发环境配置
+# 注意：生产环境的敏感配置（DSN、私钥）通过环境变量注入，不放入代码仓库
+
+chain:
+  name: "ETH"
+  chain_id: 1
+  confirms: 12
+  hot_wallet: "0xHotWalletAddressHere"
+  max_gas_gwei: 500
+  keep_eth_wei: "1000000000000000"  # 0.001 ETH
+
+  tokens:
+    - symbol: "USDT"
+      address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+      decimals: 6
+      min_sweep: "1000000"  # 1 USDT
+
+    - symbol: "USDC"
+      address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      decimals: 6
+      min_sweep: "1000000"
+
+db:
+  dsn: "wallet:password@tcp(localhost:3306)/exchange_wallet_dev?parseTime=true"
+  max_open_conn: 20
+  max_idle_conn: 5
+
+rpc:
+  endpoints:
+    - "https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY"
+    - "https://mainnet.infura.io/v3/YOUR_KEY"
+  timeout_sec: 10
+  backup_endpoint: "https://cloudflare-eth.com"
+
+keyman:
+  endpoint: "http://localhost:8081"
+  pubkey: "BASE64_ENCODED_X25519_PUBLIC_KEY"
+
+alarm:
+  lark_webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_WEBHOOK"
+
+sweep:
+  interval_sec: 300  # 5分钟
+  min_balance: "1000000"  # 最小 1 USDT
