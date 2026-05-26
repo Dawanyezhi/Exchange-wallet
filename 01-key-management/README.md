@@ -51,6 +51,7 @@
 | 文件 | 功能 | 关联 |
 |------|------|------|
 | **bip32.go** | Ed25519 BIP32 硬化派生（HMAC-SHA512） | keyman 派生地址时调用 |
+| **bip32_secp256k1.go** | secp256k1 BIP32/BIP44 派生（EVM 可用） | ETH/EVM 地址派生与 ECDSA 签名 |
 | **passphrase.go** | Scrypt+AES-128-CTR 加密/解密（兼容 Web3 Keystore V3） | keyman 启动时解密种子 |
 | **memory_clear.go** | 四步内存清除 + XOR 掩码保护 | keyman 全生命周期使用 |
 | **transport.go** | X25519 ECDH + AES-256-GCM 加密传输 | wallet↔keyman 通信加密 |
@@ -86,6 +87,95 @@ API 设计：[`docs/api-design.md`](../docs/api-design.md)（Part 2: Keyman API�
 - 生产中 Scrypt N=2^18（占用 256MB 内存），demo 测试时降低到 N=2^12 加速
 - 生产中数据库操作使用事务+行锁（`SELECT ... FOR UPDATE`），demo 使用内存 map
 - 审计日志在生产中写入独立数据库表，demo 仅打印日志
+
+## Ed25519 与 secp256k1 派生
+
+本章同时保留了两个派生 demo：
+
+- [`demo/bip32.go`](./demo/bip32.go)：Ed25519 风格的 SLIP-0010 硬化派生，用于展示签名服务内部密钥派生、安全鉴权和教学流程。
+- [`demo/bip32_secp256k1.go`](./demo/bip32_secp256k1.go)：标准 secp256k1 BIP32/BIP44 派生，用于生成 ETH/EVM 地址和 ECDSA 交易签名私钥。
+
+### 核心区别
+
+| 对比项 | Ed25519（`bip32.go`） | secp256k1（`bip32_secp256k1.go`） |
+|--------|------------------------|-----------------------------------|
+| 曲线/算法 | Ed25519 / EdDSA | secp256k1 / ECDSA |
+| 主密钥域分离常量 | `ed25519 seed` | `Bitcoin seed`（BIP32 标准常量，不代表只能用于 BTC） |
+| 派生规范 | 类 SLIP-0010，只做 hardened 派生 | BIP32，支持 hardened 与 non-hardened |
+| demo 路径表达 | 用链名映射 hardened index，例如 `Child("ETH")` | 用 BIP44 路径，例如 `m/44'/60'/0'/0/0` |
+| 公钥/地址 | 32 字节 Ed25519 公钥，不能直接生成 EVM 地址 | 可生成 EVM 地址，`crypto.PubkeyToAddress` |
+| 交易签名 | 不适合 ETH/EVM 原生交易签名 | ETH/EVM 原生交易签名使用该曲线 |
+
+Ed25519 和 secp256k1 的私钥、公钥、签名格式都不兼容。不能用 Ed25519 私钥去签 ETH 交易，也不能把 secp256k1 地址当作 Ed25519 地址验签。
+
+### 什么情况下使用
+
+使用 Ed25519：
+
+- keyman/wallet 内部请求鉴权，例如请求体签名、地址记录签名、防重放校验。
+- 教学场景中演示 hardened 派生、链码、内存清除等概念。
+- 链本身采用 Ed25519 的场景，例如部分 Solana、Cosmos SDK 变体或其他 EdDSA 链。具体仍需按目标链的地址和签名规范实现。
+
+使用 secp256k1：
+
+- ETH、EVM 兼容链、BTC 等使用 secp256k1 的链。
+- 需要生成标准 BIP44 地址路径时，例如 ETH 常用 `m/44'/60'/0'/0/index`。
+- 需要拿到 `*ecdsa.PrivateKey` 或 EVM 地址，用于构造、签名和广播链上交易。
+
+在交易所托管钱包里，常见做法是：内部服务鉴权可以用 Ed25519；链上资产地址和交易签名必须跟随目标链曲线。ETH/EVM 不能用 `bip32.go` 的 Ed25519 结果签链上交易，应使用 `bip32_secp256k1.go`。
+
+### 如何使用 secp256k1 BIP44 派生
+
+```go
+seed := MnemonicToSeed(mnemonic, "")
+
+master, err := NewSecp256k1MasterKey(seed)
+if err != nil {
+    return err
+}
+defer master.ClearKey()
+
+account, err := master.DerivePath("m/44'/60'/0'/0/0")
+if err != nil {
+    return err
+}
+defer account.ClearKey()
+
+address, err := account.EthereumAddress()
+if err != nil {
+    return err
+}
+
+privateKey, err := account.PrivateKey()
+if err != nil {
+    return err
+}
+
+_ = address
+_ = privateKey
+```
+
+对应测试：
+
+```bash
+go test ./01-key-management/demo -run '^TestSecp256k1BIP44DerivationDifferentIndexes$' -count=1 -v
+```
+
+也可以通过 Makefile 执行：
+
+```bash
+make test-bip44-indexes
+```
+
+### 使用规范
+
+- 主种子只保存一次，落盘前必须用 Scrypt + AES 加密；不要把助记词、seed、私钥明文写入日志或数据库。
+- 每条链使用自己的派生规范：ETH/EVM 使用 secp256k1 + BIP44；Ed25519 链使用对应链确认过的 SLIP-0010/地址规范。
+- ETH/EVM 推荐路径格式为 `m/44'/60'/account'/0/index`，其中 `index` 对应用户地址序号；生产中要用数据库事务和行锁维护 `next_index`，避免并发重复派生。
+- 不同用途的密钥要隔离：内部鉴权密钥、地址派生密钥、提现签名密钥不要混用同一条派生路径。
+- 子私钥只在签名或导出地址时短暂存在，用完立即调用 `ClearKey()`；返回给外部服务的只能是地址、公钥、签名结果和审计信息。
+- 测试里可以打印地址和临时私钥用于验证；生产代码禁止打印私钥、seed、chain code、助记词。
+- 不要把本 demo 包装成生产级 HD 钱包库。生产系统还需要补齐地址版本、链参数、交易编码、审计、权限控制、HSM/MPC 或更严格的签名隔离。
 
 ## 私钥的本质缺陷与 MPC 升级路径
 

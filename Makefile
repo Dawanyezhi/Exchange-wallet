@@ -29,6 +29,9 @@ test:
 test-short:
 	go test ./... -timeout 30s
 
+test-bip44-indexes:
+	go test ./01-key-management/demo -run '^TestSecp256k1BIP44DerivationDifferentIndexes$$' -count=1 -v
+
 # ─────────────────────────────────────────────
 # 单模块 Demo
 # ─────────────────────────────────────────────
