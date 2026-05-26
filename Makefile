@@ -1,5 +1,23 @@
-.PHONY: test demo simulate run-keyman lint build tidy \
+.PHONY: doctor test test-bip44-indexes demo simulate run-keyman lint build tidy \
         demo-01 demo-02 demo-03 demo-04 demo-05 demo-06 demo-07
+
+# ─────────────────────────────────────────────
+# 环境检查
+# ─────────────────────────────────────────────
+
+doctor:
+	@echo "go binary: $$(command -v go)"
+	@echo "go version: $$(go version)"
+	@echo "GOROOT: $$(go env GOROOT)"
+	@echo "GOVERSION: $$(go env GOVERSION)"
+	@if [ "$$(go env GOROOT)/bin/go" != "$$(command -v go)" ]; then \
+		echo ""; \
+		echo "ERROR: go binary and GOROOT do not match."; \
+		echo "Fix with GVM, for example:"; \
+		echo "  gvm use go1.22.0 --default"; \
+		echo "Or configure your IDE Go SDK to the same GOROOT as the go binary."; \
+		exit 1; \
+	fi
 
 # ─────────────────────────────────────────────
 # 测试
