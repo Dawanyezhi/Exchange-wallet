@@ -108,6 +108,7 @@ func (s *Syncer) processBlock(ctx context.Context, header *BlockHeader) error {
 		return fmt.Errorf("syncer: detect reorg at height %d: %w", header.Height, err)
 	}
 
+	// 大于0则出现回滚
 	if depth > 0 {
 		s.logger.Warn("reorg detected",
 			"chain", s.chain,
@@ -115,6 +116,7 @@ func (s *Syncer) processBlock(ctx context.Context, header *BlockHeader) error {
 			"depth", depth,
 			"new_parent", header.ParentHash,
 		)
+		// 执行回滚
 		if err := s.rollback(ctx, depth); err != nil {
 			return fmt.Errorf("syncer: rollback %d blocks: %w", depth, err)
 		}

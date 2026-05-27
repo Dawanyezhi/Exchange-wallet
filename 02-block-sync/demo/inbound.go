@@ -28,6 +28,7 @@ func (s *Syncer) processInbound(ctx context.Context, header *BlockHeader) error 
 			continue // 失败交易不处理（第1层防护：Receipt.Status 校验）
 		}
 
+		// 加入 bloom filter 快速过滤
 		uid, ok := managedAddrs[tx.To]
 		if !ok {
 			continue // 目标地址不在受管地址列表中

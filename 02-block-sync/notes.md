@@ -57,7 +57,7 @@ Step 2: revertInboundTx
 Step 3: revertOutboundTx
   - UPDATE wallet_outbound SET status=1（Pending）, height=0
     WHERE chain=? AND height=? AND status=2（Success）
-  - 将已确认的提现状态退回 Pending，等待重新确认
+  - 将已确认的提现状态退回 Pending，等待重新确认，无需修改用户余额，钱还在热钱包中
 
 Step 4: revertSystemTx
   - 类似 Step 3，处理归集/补费等系统交易

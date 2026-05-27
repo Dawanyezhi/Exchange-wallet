@@ -19,3 +19,32 @@
 - 本 demo 不含布隆过滤器（生产中用于 O(1) 地址查找）
 - 二次校验失败处理只有 Ignore 和 Alert，生产中还有 FuzzyCompare 模糊比对
 - 生产中 Fee Token（如 SafeMoon）需要专门处理 burn fee，本 demo 不涉及
+
+### 二次校验中的 FuzzyCompare
+
+二次校验是充值入账前的最后一道防线：系统第一次扫块识别到充值后，会通过独立 RPC 或独立查询逻辑重新拉取交易、receipt、log、区块头等数据，逐字段确认 `to`、`symbol`、`amount`、`status`、`blockHash` 是否一致。
+
+本 demo 中二次校验失败只有两种处理：
+
+- `Ignore`：忽略这笔充值，不给用户入账。
+- `Alert`：触发告警，交给人工或后续流程处理。
+
+生产系统还会有 `FuzzyCompare` 模糊比对，用于处理“字段不是完全一致，但差异在可解释范围内”的情况。例如金额单位换算、精度截断、RPC 返回格式差异、链上手续费模型等原因，可能导致两次解析结果存在极小差值。只要差值小于配置阈值，就认为二次校验通过；超过阈值才进入 `Ignore` 或 `Alert`。
+
+`FuzzyCompare` 不是放松安全校验，而是把“合理微小误差”和“真实异常”区分开，避免标准充值被误拦，同时仍然拒绝金额、地址、状态、区块哈希等关键字段明显不一致的交易。
+
+### Fee Token 与 burn fee
+
+普通 ERC20 转账通常可以理解为：用户转出多少，充值地址就收到多少。但 Fee Token、转账税代币、反射代币或燃烧手续费代币不是这样。以 SafeMoon 这类代币为例，用户发起一笔 `100` 的转账，合约可能只给充值地址 `90`，剩余部分被 burn、分配给手续费地址、流动性池或持币人。
+
+链上事件可能表现为多条 `Transfer`：
+
+```text
+Transfer(user, depositAddress, 90)
+Transfer(user, burnAddress, 5)
+Transfer(user, feeCollector, 5)
+```
+
+如果充值系统直接按交易 input 中的 `100` 入账，就会多给用户资产；如果随意取第一条或最后一条 `Transfer`，也可能把 burn 或手续费事件误认为充值。因此生产系统需要为 Fee Token 单独配置解析规则：以充值地址实际收到的金额为准，识别 burn 地址和手续费地址，并按代币合约的真实转账模型做二次校验。
+
+本 demo 只覆盖标准 ERC20 和普通主币充值逻辑，没有实现 Fee Token 的 burn fee、反射分红、转账税等特殊合约行为。

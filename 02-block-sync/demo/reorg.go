@@ -81,13 +81,15 @@ func (s *Syncer) findRollbackDepth(ctx context.Context, newHeader *BlockHeader) 
 // rollback 执行原子回滚，从 Back 向前逐块回滚 depth 个块。
 //
 // 每次 RevertBlock 调用在数据库层面是一个事务：
-//   Step 1: revertBalance    - 回滚余额变更
-//   Step 2: revertInboundTx  - 删除充值记录
-//   Step 3: revertOutboundTx - 提现状态退回 Pending
-//   Step 4: revertSystemTx   - 系统交易退回 Pending
-//   Step 5: revertHeader     - 删除区块头
-//   Step 6: revertHeight     - Back 减1
+//
+//	Step 1: revertBalance    - 回滚余额变更(通过该区块内的余额变更日志)
+//	Step 2: revertInboundTx  - 删除充值记录
+//	Step 3: revertOutboundTx - 提现状态退回 Pending(余额不需要修改, 钱还在热钱包地址, 重新发送上链即可)
+//	Step 4: revertSystemTx   - 系统交易退回 Pending
+//	Step 5: revertHeader     - 删除区块头
+//	Step 6: revertHeight     - Back 减1
 func (s *Syncer) rollback(ctx context.Context, depth int) error {
+	// 本地已保存的最新区块
 	heights, err := s.repo.GetHeights(ctx)
 	if err != nil {
 		return fmt.Errorf("rollback: get heights: %w", err)

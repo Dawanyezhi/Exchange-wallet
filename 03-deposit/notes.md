@@ -94,7 +94,7 @@ func (w *Whitelist) Verify(ctx context.Context, rpc RPCClient) error {
 // 获取 Receipt 后，对比 receipt.BlockHash 和当前处理的 header.Hash
 if receipt.BlockHash != currentHeader.Hash {
     // 该交易在重组期间被重新打包到了其他块
-    // 从备用节点重新获取 Receipt 验证
+    // 从备用节点重新获取 Receipt 验证（二次确认）
     receipt2, _ := backupRPC.GetTransactionReceipt(ctx, txHash)
     if receipt2.BlockHash != currentHeader.Hash {
         return false, nil  // 确实不在本块，跳过

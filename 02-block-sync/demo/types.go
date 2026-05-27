@@ -62,8 +62,8 @@ type Header struct {
 // Height 高度指针（Front/Back）。
 type Height struct {
 	Chain string    `db:"chain"`
-	Front int64     `db:"front"`
-	Back  int64     `db:"back"`
+	Front int64     `db:"front"` // 安全高度（Back - 确认数）
+	Back  int64     `db:"back"`  // 已扫描的最新块高度（等于链上 latest - some_delay）
 	CTime time.Time `db:"ctime"`
 	MTime time.Time `db:"mtime"`
 }
@@ -81,9 +81,9 @@ type Inbound struct {
 	Fee    string    `db:"fee"`
 	Status int       `db:"status"` // 0=Pending 1=Success 4=Revert
 	UID    int64     `db:"uid"`
-	BTime  time.Time `db:"btime"`
-	CTime  time.Time `db:"ctime"`
-	MTime  time.Time `db:"mtime"`
+	BTime  time.Time `db:"btime"` // 充值所在区块的时间戳
+	CTime  time.Time `db:"ctime"` // 记录创建时间
+	MTime  time.Time `db:"mtime"` // 记录更新时间
 }
 
 const (
