@@ -32,9 +32,9 @@ type WithdrawRequest struct {
 
 // TxBuilder 交易构建器：含 EIP-155 签名 + 签名验证。
 type TxBuilder struct {
-	chainID    *big.Int
-	signer     Signer
-	maxGasWei  *big.Int // MaxFee 保护上限
+	chainID   *big.Int
+	signer    Signer
+	maxGasWei *big.Int // MaxFee 保护上限
 }
 
 // NewTxBuilder 创建交易构建器。
@@ -80,6 +80,7 @@ func (b *TxBuilder) BuildERC20Transfer(ctx context.Context, req *WithdrawRequest
 	}
 
 	// 编码 ERC20 transfer(address,uint256) 调用数据
+	// 从热钱包地址中转移erc20代币
 	data, err := encodeERC20Transfer(req.To, req.Amount)
 	if err != nil {
 		return nil, fmt.Errorf("tx_builder: encode ERC20 transfer: %w", err)
@@ -87,7 +88,7 @@ func (b *TxBuilder) BuildERC20Transfer(ctx context.Context, req *WithdrawRequest
 
 	tx := types.NewTx(&types.LegacyTx{
 		Nonce:    req.Nonce,
-		To:       req.TokenAddress, // 调用合约地址，不是目标地址
+		To:       req.TokenAddress, // 调用合约地址，不是目标地址（将请求发送给合约）
 		Value:    big.NewInt(0),    // ERC20 转账不发 ETH
 		Gas:      req.GasLimit,
 		GasPrice: req.GasPrice,
@@ -101,6 +102,8 @@ func (b *TxBuilder) BuildERC20Transfer(ctx context.Context, req *WithdrawRequest
 // 签名后立即调用，防止签名服务返回错误签名。
 func (b *TxBuilder) VerifySignature(tx *types.Transaction, expectedSender common.Address) error {
 	etherSigner := types.NewEIP155Signer(b.chainID)
+
+	// 从带有签名的交易体中恢复发送方地址
 	recovered, err := types.Sender(etherSigner, tx)
 	if err != nil {
 		return fmt.Errorf("tx_builder: recover sender: %w", err)
@@ -113,14 +116,18 @@ func (b *TxBuilder) VerifySignature(tx *types.Transaction, expectedSender common
 }
 
 func (b *TxBuilder) sign(ctx context.Context, tx *types.Transaction, req *WithdrawRequest) (*types.Transaction, error) {
+	// EIP-155 签名 将chainId写入签名中
 	etherSigner := types.NewEIP155Signer(b.chainID)
+	// 交易体hash
 	hash := etherSigner.Hash(tx)
 
+	// 获取签名字节
 	sig, err := b.signer.Sign(ctx, hash.Bytes(), req.ChainName)
 	if err != nil {
 		return nil, fmt.Errorf("tx_builder: sign: %w", err)
 	}
 
+	// 获取带有签名的交易体
 	signed, err := tx.WithSignature(etherSigner, sig)
 	if err != nil {
 		return nil, fmt.Errorf("tx_builder: apply signature: %w", err)
