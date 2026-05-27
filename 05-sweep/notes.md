@@ -56,7 +56,7 @@ func (f *Filter) checkNoPendingWithdraw(addr string) bool {
 ```
 
 ### Step 4: Fee（补费）
-
+考虑点：是否可以先将同一个地址下需要归集的所有币种进行统计，然后按照币种类型和待归集次数计算总的补费
 ```go
 func (p *Pipeline) fee(ctx context.Context, built <-chan *SweepTx) error {
     for tx := range built {
