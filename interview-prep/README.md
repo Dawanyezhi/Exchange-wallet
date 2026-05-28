@@ -574,15 +574,23 @@ KeepETH 配置，归集主币时保留最小余额，确保地址上还有 Gas �
 
 **回答**：
 
-Nonce 我们是本地缓存管理，启动时从数据库加载上次记录的 Nonce，不是每次启动都从 RPC 查——这样更快，也不依赖节点状态。每次广播一笔交易就 +1，本地严格维护。workorder 工具处理 RECOVER 等特殊场景时会从 RPC 同步一次 Nonce，日常提现走数据库加载。
+Nonce 按 `chain + from_address` 管理，且要落库做状态机。使用 `nonce_counter` 表记录每个出币地址的 `next_nonce`，同时在提现交易表里记录 `chain/from/nonce/withdrawal_id/tx_hash/raw_tx/gas/status`，并加唯一约束 `UNIQUE(chain, from_address, nonce)`。分配 Nonce 时用事务和行锁，`SELECT ... FOR UPDATE` 拿到 `next_nonce`，同一事务里把 `next_nonce+1` 并插入交易记录。
 
-关键是严格串行，Filter 阶段有内存 Nonce 缓存防止并发构建交易用同一个 Nonce——Nonce 冲突的话矿工只会接受一笔，另一笔就丢了或者被替换。
+启动时会做 DB 和 RPC 双校准：读取 `DB next_nonce`、`RPC latest nonce`、`RPC pending nonce`。
 
-Nonce 卡住的情况也处理过——Gas 设太低导致交易一直 pending，后续的 Nonce 都被卡住了。处理方式是用 genrbf 对卡住的那笔做 RBF，提高 Gas Price，让它先确认，后面的队列才能继续动。
+`latest` 是链上已确认进度，`pending` 是节点看到的确认交易加 mempool 后的进度，DB 是钱包系统自己的分配进度。正常情况下 `latest <= pending`，DB 应该和 pending 对齐。
+
+启动时通常取 `max(DB next_nonce, RPC pending nonce)`，但如果 DB 比 pending 大很多，不能盲目继续发，要检查中间 Nonce 的 raw tx 是否广播成功、是否被 mempool 丢弃。
+
+Nonce 分配后就要落库，不是等交易确认后再更新。因为 RPC 超时不等于广播失败，交易可能已经进入 mempool；如果这时进程崩溃而 DB 没记录，重启后复用同一个 Nonce 就会冲突。正确流程是：分配 Nonce → 落库为 `ALLOCATED` → 签名生成 `raw_tx/tx_hash` → 广播 → 更新为 `BROADCASTED/PENDING/CONFIRMED/FAILED/DROPPED/REPLACED`。
+
+遇到 Nonce 卡住，不能直接加速最新一笔，要找这个地址最小的 pending Nonce。比如 `100` 卡住，`101/102` 即使 Gas 很高也不会先上链。处理方式是对 `100` 做同 Nonce 替换交易，提高 Gas Price 加速，或者发同 Nonce 的 0 value 自转取消交易。所有 replacement tx 都要绑定同一个 `withdrawal_id`，避免把加速交易当成新的提现，造成重复出款。
 
 **如果追问**：多个服务同时发交易 Nonce 冲突怎么办？
 
-设计上就是单点发送，提现由 wallet 进程串行处理，不允许多个进程同时往同一个热钱包地址发交易。如果真的要多热钱包并行，就给每个热钱包独立的 Nonce 管理，互不干扰。
+锁粒度应该是 `chain + from_address`。同一个热钱包地址不允许多个进程并发分配 Nonce，靠数据库行锁和唯一约束兜底；如果要提高吞吐，不是放开同地址并发，而是增加多个热钱包地址，每个热钱包有独立的 NonceManager。这样同地址内部严格串行，不同地址之间水平并行。
+
+所以总结起来就是：按地址管理、分配即落库、DB/RPC 启动校准、pending 找最小 Nonce 修复、替换交易绑定原业务单；效率不够就用多热钱包并行，而不是让一个地址并发抢 Nonce。
 
 ---
 
@@ -604,7 +612,17 @@ EVM 链统一用 ethfork 一个服务搞定，支持 60+ 条链，链间差异�
 
 **回答**：
 
-我们的告警分五个维度：同步告警（深度重组、RPC 故障、同步超时）、充提告警（未知地址大额充值、处理失败、二次校验失败）、高度监控（节点冻结超 600 秒、落后超 100 块、持续两小时偶发错误）、对账告警（余额偏差超阈值）、配置变更告警。
+我们的告警分五个维度：
+
+区块同步告警（深度重组、RPC 故障、同步超时）、
+
+高度监控（节点冻结超 600 秒、落后超 100 块、持续两小时偶发错误）、
+
+充提告警（提现失败、充值二次校验失败）、
+
+对账告警（余额偏差超阈值）、
+
+配置变更告警。
 
 通知渠道是 Lark 和钉钉机器人，通过 watchandnotify 模块推送。
 
@@ -628,7 +646,9 @@ EVM 链统一用 ethfork 一个服务搞定，支持 60+ 条链，链间差异�
 
 **如果追问**：热钱包余额管理策略？
 
-热钱包维持一个目标余额区间，低于下限就从冷钱包（icelake）补充，高于上限就归到冷钱包。归集是热钱包的主要补充来源——充值地址的散币归集后先进热钱包，归集阈值可配，ERC20 归集还有动态 Gas 补费（Gas Price ≤10Gwei 补 0.006 ETH，≤50Gwei 补 0.01 ETH，>50Gwei 补 0.1 ETH）。另外 KeepETH 配置保证归集主币时地址上保留最小余额，防止地址彻底清空后没 Gas 处理后续充值。整体策略是：热钱包够用就不动冷钱包，冷钱包是最后的资金池。
+热钱包维持一个目标余额区间，低于下限就从冷钱包（icelake）补充，高于上限就归到冷钱包。归集是热钱包的主要补充来源——充值地址的散币归集后先进热钱包，归集阈值可配，ERC20 归集还有动态 Gas 补费（Gas Price ≤10Gwei 补 0.006 ETH，≤50Gwei 补 0.01 ETH，>50Gwei 补 0.1 ETH）。另外 KeepETH 配置保证归集主币时地址上保留最小余额，防止地址彻底清空后没 Gas 处理后续充值。
+
+整体策略是：热钱包够用就不动冷钱包，冷钱包是最后的资金池。
 
 ---
 
@@ -768,11 +788,39 @@ gRPC TLS 加密传输签名结果（仅签名，绝不含私钥）。钱包收�
 
 **④ 钱包 → 交易所：充值通知真实性**
 
-钱包处理完每笔提现时，用 ksrv 对订单数据签名（WalletModule 签名），连同所有上游模块的原始签名一起打包成完整的 Signatures 链路推送给交易所，交易所可以验证整条签名链路，确认这笔提现确实经过了每个环节的审批。充值通知侧，KMS 签发凭证随 MQ 推送，交易所验签后上账。
+钱包处理完每笔提现时，用 ksrv 对订单数据签名（WalletModule 签名-单独的钱包服务私钥），连同所有上游模块的原始签名一起打包成完整的 Signatures 链路推送给交易所，交易所可以验证整条签名链路，确认这笔提现确实经过了每个环节的审批。
+
+充值通知侧，KMS 签发凭证随 MQ 推送，交易所验签后上账。
 
 **⑤ 钱包 → 链节点 RPC：数据可信性**
 
 MultiClient 多节点轮询，syncer 和 verifytx 用不同的 RPC 端点，7 层防护里的 BlockHash 一致性检查 + 二次校验独立拉取，两个节点同时造假概率极低，发现不一致立刻告警人工介入。
+
+签名分类：
+
+（1）业务层给钱包服务的签名
+
+订单带有风控/财务等模块签名，代表提现订单的有效性，无法从业务层伪造
+
+Ed25519Verify(riskPublicKey, payload, riskSignature)
+
+Ed25519Verify(financePublicKey, payload, financeSignature)
+
+（2）钱包服务和签名服务之间的 gRPC TLS 和 mTLS 认证
+
+钱包服务和签名服务进行双向认证以及加密通信，确保请求来自合法的钱包服务和传输过程中不被窃听
+
+（3）链上交易签名和验签
+
+钱包服务拿到签名服务的签名后，进行验签，恢复出发送地址确保是预期的地址，并且签名是自己构造的那笔交易。防止签名服务被攻破
+
+VerifySignature(signedTx, expectedFromAddress)
+
+（4）钱包服务充值/提现通知交易所签名
+
+这一步是为了证明充值和提现通知的有效性，即使mq或数据库被篡改，也无法伪造合法的充值通知
+
+walletSig = Sign(WalletModulePrivateKey, canonical(withdraw_result))
 
 ---
 
