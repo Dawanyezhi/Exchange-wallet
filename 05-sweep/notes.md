@@ -34,7 +34,7 @@ func (f *Filter) checkSafeHeight(addr string, safeHeight int64) bool {
 **Pending 检查**：
 ```go
 // 有 Pending 状态的提现时不归集
-// 防止 Nonce 冲突（提现和归集共用同一热钱包地址时）
+// 防止 Nonce 冲突（提现和补费共用同一热钱包地址时）
 func (f *Filter) checkNoPendingWithdraw(addr string) bool {
     return f.repo.GetPendingWithdrawCount(addr) == 0
 }
