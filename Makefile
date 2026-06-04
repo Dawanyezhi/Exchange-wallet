@@ -1,5 +1,6 @@
 .PHONY: doctor test test-bip44-indexes demo simulate run-keyman lint build tidy \
-        demo-01 demo-02 demo-03 demo-04 demo-05 demo-06 demo-07
+        demo-01 demo-02 demo-03 demo-04 demo-05 demo-06 demo-07 demo-08 demo-08-sign demo-08-parse \
+        demo-09 demo-09-sign demo-09-parse
 
 # ─────────────────────────────────────────────
 # 环境检查
@@ -64,8 +65,34 @@ demo-07:
 	@echo "=== 07 MPC Key Management Demo ==="
 	go run ./07-mpc-key-management/demo/
 
+demo-08:
+	@echo "=== 08 BTC Manager Demo ==="
+	$(MAKE) demo-08-sign
+	$(MAKE) demo-08-parse
+
+demo-08-sign:
+	@echo "=== 08 BTC Tx Sign + Send Demo ==="
+	go run ./08-btc-manager/tx-sign-send/
+
+demo-08-parse:
+	@echo "=== 08 BTC Block Tx Parser Demo ==="
+	CGO_ENABLED=0 go run ./08-btc-manager/block-tx-parser/ -mode parse-block -block-hash 0000000000000000000162f179adec6f69571824971aa1fa5e78a6074be22864
+
+demo-09:
+	@echo "=== 09 SOL Manager Demo ==="
+	$(MAKE) demo-09-sign
+	$(MAKE) demo-09-parse
+
+demo-09-sign:
+	@echo "=== 09 SOL Tx Sign + Send Demo ==="
+	go run ./09-sol-manager/tx-sign-send/
+
+demo-09-parse:
+	@echo "=== 09 SOL Block Tx Parser Demo ==="
+	CGO_ENABLED=0 go run ./09-sol-manager/block-tx-parser/ -mode sample
+
 # 所有 demo 顺序运行
-demo: demo-01 demo-02 demo-03 demo-04 demo-05 demo-06 demo-07
+demo: demo-01 demo-02 demo-03 demo-04 demo-05 demo-06 demo-07 demo-08 demo-09
 
 # ─────────────────────────────────────────────
 # 端到端模拟（串联所有场景）

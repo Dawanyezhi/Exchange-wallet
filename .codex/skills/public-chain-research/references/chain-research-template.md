@@ -85,6 +85,23 @@
 - 签后反解析和验签：确认 raw tx 中的输出、费用、链参数与预期一致。
 - 广播、重发、加速、替换或取消机制。
 
+必须给出一个生产案例，至少包含一笔提现或归集交易。案例不能只写抽象流程，必须按该链真实交易模型列出：
+
+- 业务请求字段：chain/network、business id、from/to、amount、token/memo/tag、fee 策略。
+- 链上状态输入：Account 链的 nonce/balance，UTXO 链的 outpoint/amount/script，Memo 链的 tag 归属，多资产链的合约地址和资产 id。
+- unsigned tx 或等价结构：版本、nonce/sequence/recent blockhash、inputs/outputs、to/value/data、memo/tag、fee 字段。
+- 签名服务请求和响应：派生路径或 key id、公钥、签名哈希构造依赖、签名格式；明确签名服务不能只盲签调用方传入的 32 字节 hash。
+- 签名前策略校验：地址归属、输出白名单、找零归属、Token 合约白名单、手续费上限、nonce/UTXO 锁、memo/tag 校验。
+- 签后校验：raw tx 反解析、本地验签、费用复算、业务输出核对、tx hash/txid/wtxid 计算。
+- 广播和落库：广播 RPC、mempool/预执行检查、rawtx 表、提现/归集状态机、失败重试/RBF/加速/取消策略。
+
+按链模型补充关键差异：
+
+- Account/Nonce 链：展示 nonce 锁定、chain id 防重放、gas limit/fee cap、Token transfer data。
+- UTXO 链：展示选币、找零、dust、每个 input 的 previous output 金额和脚本、sighash、witness/scriptSig。
+- Memo/Tag 链：展示 memo/tag 在 unsigned tx、签名前校验和签后反解析中的位置。
+- L2/桥链：展示 L2 chain id、finality/挑战期、官方桥或跨域消息相关字段。
+
 ## 7. Token、NFT、Memo/Tag
 
 Token 调研：
