@@ -62,7 +62,7 @@ func runParseTransaction(inputFile string, rpcURL string, signature string) erro
 		return err
 	}
 	var tx RPCTransaction
-	if err := jsonUnmarshal(raw, &tx); err != nil {
+	if err := jsonUnmarshal(unwrapRPCResult(raw), &tx); err != nil {
 		return err
 	}
 	summary, err := ParseTransaction(tx)
@@ -117,6 +117,10 @@ func printTx(tx ParsedTxSummary, index int) {
 	}
 	for _, delta := range tx.TokenDeltas {
 		fmt.Printf("  token account=%s owner=%s mint=%s delta=%s decimals=%d program=%s\n",
+			delta.Account, delta.Owner, delta.Mint, delta.DeltaBaseUnit, delta.Decimals, delta.ProgramID)
+	}
+	for _, delta := range tx.CreditableTokenDeltas {
+		fmt.Printf("  creditable token account=%s owner=%s mint=%s delta=%s decimals=%d program=%s\n",
 			delta.Account, delta.Owner, delta.Mint, delta.DeltaBaseUnit, delta.Decimals, delta.ProgramID)
 	}
 }

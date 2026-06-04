@@ -465,6 +465,89 @@ CGO_ENABLED=0 go run ./09-sol-manager/block-tx-parser \
 - SPL Token 入账优先解析 `preTokenBalances/postTokenBalances`，以 mint、token account、owner、decimals 为准。
 - `getBlock`/`getTransaction` 的公共 RPC 历史能力可能受限，生产应使用自建 RPC、归档能力或可靠索引器做补偿。
 
+#### 6.5.3 当前交易解析流程汇总
+
+当前 `09-sol-manager/block-tx-parser` 的解析目标是把 Solana `getBlock/getTransaction` 返回的 `jsonParsed` 或 raw JSON 结果，归一成交易摘要，供后续匹配我方地址、生成充值/提现/系统交易和做对账审计。它不是完整生产索引器，但已经覆盖了 SOL 主币转账、余额差额、SPL Token 余额差额和失败交易过滤的关键边界。
+
+整体流程：
+
+```text
+getBlock/getTransaction JSON
+  -> unwrapRPCResult
+  -> ParseBlockJSON / ParseTransaction
+  -> resolveAccountKeys
+  -> parseBalanceDeltas
+  -> parseSystemTransferInstruction(outer + inner)
+  -> parseTokenDeltas
+  -> CreditableTokenDeltas
+  -> 后续业务匹配本地地址/Token Account/mint 白名单
+```
+
+区块级解析：
+
+1. `ParseBlockJSON` 先兼容两种输入：完整 JSON-RPC 响应和已经剥离到 `result` 的 block JSON。
+2. 解析 `blockhash`、`previousBlockhash`、`parentSlot`、`blockHeight`、`blockTime` 和交易数量。
+3. 对 `transactions[]` 逐笔调用 `ParseTransaction`。任意一笔交易结构异常会返回带 `tx[index]` 的错误，生产实现不应直接推进 checkpoint，应把该 slot 标记为 `Retry/Failed` 并补偿复查。
+
+交易级解析：
+
+1. 先校验 `transaction.signatures[0]` 存在。Solana 的第一签名就是交易 ID，也是后续入库唯一键的核心字段。
+2. 调用 `resolveAccountKeys` 还原完整账户列表：先读取 message 静态 `accountKeys`，再追加 v0 transaction 的 `meta.loadedAddresses.writable/readonly`。raw instruction 的 `programIdIndex/accounts` 和 token balance 的 `accountIndex` 都必须基于这个 resolved account keys 解释。
+3. 设置 `fee_payer = account_keys[0]`，记录 `meta.fee` 和 `meta.err`。`meta.err != null` 表示交易执行失败，不能生成可入账充值。
+4. 调用 `parseBalanceDeltas` 对齐 `preBalances/postBalances`，得到每个账户的 SOL 余额变化。SOL 主币充值/提现应优先基于余额差额命中我方地址，而不是只相信 instruction。
+5. 遍历外层 `message.instructions`，调用 `parseSystemTransferInstruction` 解析 System Program transfer。该函数同时支持 `jsonParsed` 的 `parsed.info.source/destination/lamports` 和 raw instruction 的 `programIdIndex/accounts/data`。
+6. 遍历 `meta.innerInstructions`，继续解析 CPI 中的 System Program transfer，并把来源标记为 `inner_instruction_N`。生产扫块不能只看外层 instruction。
+7. 调用 `parseTokenDeltas`，按 `accountIndex + mint + programId` 配对 `preTokenBalances/postTokenBalances`，计算 Token base units 差额。金额使用十进制字符串和 `big.Int` 做差，不能转 `float64`。
+8. 只有 `meta.err == nil` 且 `DeltaBaseUnit` 为正数的 Token delta 会进入 `CreditableTokenDeltas`。失败交易中的 Token delta 只保留在 `TokenDeltas` 里做审计，不允许入账。
+
+当前输出字段含义：
+
+| 字段 | 来源 | 钱包用途 |
+|------|------|----------|
+| `Signature` | `transaction.signatures[0]` | 交易唯一键、提现状态查询、充值幂等 |
+| `Err` | `meta.err` | 非空则失败交易，不能入账 |
+| `FeeLamports` | `meta.fee` | 实际链上手续费，对账和提现成本 |
+| `FeePayer` | resolved account keys 第 0 个账户 | 手续费归属判断，避免把 fee 误算到用户充值金额 |
+| `AccountKeys` | 静态账户 + loaded addresses | 解析 raw instruction 和 token balance accountIndex |
+| `SOLTransfers` | outer/inner System Program transfer | 审计字段，辅助还原 from/to/lamports |
+| `BalanceDeltas` | `preBalances/postBalances` | SOL 主币充值、提现和手续费影响的主要依据 |
+| `TokenDeltas` | `preTokenBalances/postTokenBalances` | SPL Token 余额变化审计字段，失败交易也保留 |
+| `CreditableTokenDeltas` | 成功交易且正向 Token delta | Token 入账候选，仍需白名单和归属校验 |
+
+主币 SOL 的当前入账判断应按下面顺序接入后续业务：
+
+1. 过滤 `Err != nil` 的失败交易。
+2. 遍历 `BalanceDeltas`，找到 `delta > 0` 且 `Address` 命中我方用户 SOL 地址的记录。
+3. 用 `Signature + Address` 或 `Signature + Address + delta` 做候选幂等键，再结合 slot、blockhash 和 finalized checkpoint 落库。
+4. 用 `SOLTransfers` 做辅助审计：校验是否存在对应 System transfer，识别 CPI 转账和多 instruction 交易，但不要只靠它计算入账金额。
+5. fee payer 的负向 delta 通常包含手续费，不能误判为用户转出或冲抵用户充值金额。
+
+SPL Token 的当前入账判断应按下面顺序接入后续业务：
+
+1. 过滤 `Err != nil` 的失败交易。
+2. 遍历 `CreditableTokenDeltas`，只处理 `DeltaBaseUnit > 0` 的入账候选。
+3. 校验 `Mint` 命中资产白名单，`ProgramID` 是允许的 Token Program 或 Token-2022 Program，`Decimals` 与配置/链上 mint 一致。
+4. 用 `Account` 命中我方 token account/ATA 表，并校验 `Owner` 与登记的钱包 owner 一致。
+5. 入账金额使用 `DeltaBaseUnit`，不要使用 `uiAmount`，也不要直接信任 transfer instruction data。
+6. 充值唯一键建议包含 `chain + signature + mint + token_account`；若后续解析 instruction 明细，还应补充 `instruction_index/inner_index`，防止一笔交易内多个同 mint/token account 变化造成歧义。
+
+当前 demo 已覆盖的安全边界：
+
+- 兼容完整 RPC envelope 和 result JSON，便于离线样本和在线 RPC 共用一套解析逻辑。
+- 兼容 `encoding=json` 的字符串账户数组和 `encoding=jsonParsed` 的对象账户数组。
+- 支持 v0 transaction 的 `loadedAddresses`，避免 raw instruction 下标解析错位。
+- raw System Program transfer 会解码 base58 instruction data，并校验 instruction id 为 transfer。
+- Token 金额以 `uiTokenAmount.amount` 的 base units 字符串处理，使用大整数做差，避免 int64 溢出和小数精度问题。
+- 失败交易不会产生 `CreditableTokenDeltas`，避免把失败交易或 revert 后的余额快照误入账。
+
+生产落地仍需补齐：
+
+- 落库 `slot/blockhash/previousBlockhash/signature/instruction_index/inner_index`，支持 finalized checkpoint、重扫幂等和异常回放。
+- 增加我方地址表、token account/ATA 表、mint 白名单和 Token-2022 FeatureGate 的强校验。
+- 解析 Token Program 的 `transfer/transferChecked`、ATA 创建、Memo Program、closeAccount、approve、setAuthority 等 instruction 明细，用于审计和拒绝非预期出账。
+- 对充值候选执行独立 `getTransaction(signature, finalized)` 二次校验，复核 `err`、blockhash、余额 delta、mint、token account、owner 和 decimals。
+- 对同一交易内多个正向 delta、账户关闭退 rent、Token-2022 transfer fee/hook/memo 扩展、共享地址 memo 缺失等场景建立人工处理和告警规则。
+
 ### 6.6 生产案例扩展：SPL Token 提现 TransferChecked
 
 SPL Token 提现使用 Token Program 或 Token-2022 Program 的 `TransferChecked`。不要用 symbol 判断资产，必须以 mint address 和 token program id 为准。
@@ -756,19 +839,25 @@ Solana 可以按 slot 拉 `getBlock`。注意 slot 不等于连续产出块，�
 - `getBlock/getTransaction/getSignaturesForAddress` 对旧数据的可用性依赖节点配置。
 - 交易所上线前必须确定业务起始 slot，并保存自建索引结果。
 
-## 10. 费用模型
+## 10. 交易手续费管理方案
 
 官方资料确认：
 
+- Solana 交易费用由 base fee 和可选 priority fee 组成，费用由 fee payer 支付。
 - 交易 base fee 按签名数收取，常见为每个签名 5000 lamports。
-- 交易可以通过 Compute Budget instruction 设置 compute unit limit 和 compute unit price，形成 priority fee。
+- 交易可以通过 Compute Budget instruction 设置 compute unit limit 和 compute unit price，形成 priority fee，提高交易被当前 leader 优先调度的概率。
+- priority fee 使用 micro-lamports 计价，实际 lamports 费用为 `ceil(compute_unit_limit * compute_unit_price_micro_lamports / 1_000_000)`。
+- `getRecentPrioritizationFees` 返回近期 priority fee 样本，可按 writable accounts 过滤，但样本只反映节点近期缓存，不能当作绝对成交价。
+- `getFeeForMessage` 可基于序列化 message 返回当前集群会收取的 lamports 费用，适合签名前和签后复算。
 - 创建账户需要达到 rent-exempt 最低余额，Token Account/ATA 创建会占用 SOL。
 
 费用组成：
 
 ```text
-总成本 = base fee + priority fee + 可选账户创建 rent-exempt 成本
-priority fee = compute_unit_limit * compute_unit_price
+总成本 = network_fee + 可选账户创建 rent-exempt 成本 + 可选 Token-2022 transfer fee
+network_fee = base_fee + priority_fee
+base_fee = signer_count * lamports_per_signature
+priority_fee = ceil(compute_unit_limit * compute_unit_price_micro_lamports / 1_000_000)
 ```
 
 示例：
@@ -783,14 +872,211 @@ priority fee = 0 时，总手续费约 5000 lamports
 SPL Token 提现可能额外包含：
 
 - 创建目标 ATA 的 rent-exempt lamports。
-- Token transfer instruction 手续费。
+- 标准 SPL Token transfer 本身没有独立网络手续费，但会增加交易 compute 消耗。
+- Token-2022 若启用 transfer fee extension，可能产生 token 层面的转账扣费，不能和 Solana network fee 混在一起。
 - priority fee。
 
-工程建议：
+### 10.1 手续费账户和资金池
 
-- 提现表中区分 `network_fee` 和 `account_creation_cost`。
-- 如果交易所为用户创建目标 ATA，需要业务明确该成本由谁承担。
-- 手续费上限不能只看 base fee，必须把 priority fee 和创建账户成本一起纳入风控。
+交易所钱包不建议让每个用户充值地址都承担提现手续费。生产方案应指定系统 fee payer，通常是 SOL 热钱包或专用手续费账户。
+
+账户策略：
+
+- SOL 主币提现：`from_address` 可同时作为 fee payer；如果使用独立 fee payer，必须确认 source 和 fee payer 都在授权 signer 范围内。
+- SPL Token 提现：建议使用系统 SOL fee payer 支付 network fee 和可选 ATA rent，source token account 只负责扣 token。
+- 归集交易：由归集目标或归集热钱包承担 fee，避免从用户地址持续补 SOL。
+- 创建 ATA：payer 必须是系统地址或明确授权地址，不能让未知外部账户作为 payer。
+
+资金池管理：
+
+- 每个 fee payer 维护 `available_lamports`、`reserved_lamports`、`pending_fee_lamports`、`rent_reserved_lamports`。
+- 构建交易时先冻结最大费用预算：`max_network_fee + account_creation_cost`，交易 finalized 后用链上实际 `meta.fee` 和实际 rent 占用回写。
+- fee payer 余额低于 `min_available_lamports` 时暂停新提现构建，只允许状态补偿和必要重播。
+- fee payer 余额低于 `warning_lamports` 时告警；低于 `critical_lamports` 时暂停归集或低优先级提现。
+- 每日统计每类业务的 SOL 手续费、ATA rent 占用、Token-2022 transfer fee，纳入财务和风控报表。
+
+### 10.2 费用归属和会计口径
+
+费用不能只记录一个 `fee` 字段，业务层至少区分：
+
+| 字段 | 含义 | 归属建议 |
+|------|------|----------|
+| `network_fee` | 链上 `meta.fee`，包含 base fee 和 priority fee | 平台成本或用户提现手续费收入冲抵 |
+| `base_fee` | 按签名数估算或从 message 复算的基础费 | 成本分析 |
+| `priority_fee` | Compute Budget 产生的优先费 | 拥堵成本，需单独监控 |
+| `account_creation_cost` | 创建 ATA/Nonce Account 的 rent-exempt 占用 | 由业务策略决定平台承担或用户承担 |
+| `token_transfer_fee` | Token-2022 mint 扩展扣收的 token 层费用 | 影响到账数量，不能计入 SOL 手续费 |
+| `fee_payer` | 实际支付 SOL 手续费的地址 | 资金池和余额对账 |
+
+建议提现表中保存用户展示手续费和链上实际手续费两套口径：
+
+- `charged_fee_amount`：业务向用户收取的提现手续费，可为 SOL 或 token。
+- `network_fee_lamports`：链上实际扣 SOL。
+- `platform_fee_profit_loss`：收取手续费与链上成本差额，用于财务核算。
+
+### 10.3 交易构建时的动态 priority fee 策略
+
+Solana 的 priority fee 不是每笔交易都必须加。交易构建服务应先确定业务优先级，再决定是否加入 Compute Budget instruction。
+
+建议默认分层：
+
+| 档位 | 适用场景 | priority fee 策略 |
+|------|----------|-------------------|
+| `none` | 普通充值归属处理、普通归集、非高峰期小额提现 | 不加 `setComputeUnitPrice`，只付 base fee |
+| `low` | 普通提现、轻微拥堵、业务要求较快确认 | 使用近期样本 p50 或最小非零值，并设很低上限 |
+| `medium` | 用户提现排队积压、热钱包归集影响出款、slot 正常但确认延迟升高 | 使用近期样本 p75，或 p50 乘以安全系数 |
+| `high` | 大额提现审批通过后需尽快广播、市场波动时提现 SLA 提升、前序交易多次过期 | 使用近期样本 p90/p95，但必须受业务硬上限约束 |
+| `manual` | 极端拥堵、主网异常、RPC 大面积不一致 | 暂停自动提价，人工审批费率和批次 |
+
+动态取样流程：
+
+1. 获取 `getLatestBlockhash`，记录 `blockhash` 和 `last_valid_block_height`。
+2. 根据交易 message 识别 writable accounts，优先用 fee payer、source account、source token account、destination token account 查询 `getRecentPrioritizationFees`。
+3. 同时拉取不带 account 过滤的全局样本，避免局部账户样本过少。
+4. 剔除过旧 slot、异常极值和明显错误返回；样本为空时使用本地配置的保守默认值。
+5. 按业务档位选择 p50/p75/p90/p95，并乘以 `urgency_multiplier`，再被 `max_priority_fee_lamports` 和 `max_compute_unit_price_micro_lamports` 截断。
+6. 估算或 simulate 交易 compute units，设置合理 `compute_unit_limit`。不要盲目使用过高 CU limit，因为 priority fee 按请求的 limit 计费。
+7. 在 message 最前面放置 `ComputeBudget` instructions，再放真实转账、创建 ATA 等业务 instruction。
+8. 调用 `getFeeForMessage` 复算总 network fee，确认不超过业务单、币种和全局风控上限。
+9. 签名前把 `compute_unit_limit`、`compute_unit_price_micro_lamports`、`estimated_priority_fee`、`max_fee_lamports` 写入签名策略上下文，签名机必须反解析校验。
+
+示例策略：
+
+```text
+business_priority = medium
+sample_p75 = 1200 micro-lamports/CU
+urgency_multiplier = 1.25
+compute_unit_limit = 250000
+
+compute_unit_price = min(ceil(1200 * 1.25), max_unit_price)
+                   = 1500 micro-lamports/CU
+priority_fee       = ceil(250000 * 1500 / 1_000_000)
+                   = 375 lamports
+network_fee        = base_fee + priority_fee
+```
+
+### 10.4 何时需要 priority fee
+
+建议启用 priority fee 的条件：
+
+- 最近 N 分钟提现广播后进入 `Broadcast/Unknown` 或 `Pending` 的比例升高。
+- recent blockhash 多次过期，交易未能在有效窗口内确认。
+- `getRecentPrioritizationFees` 的近期非零样本占比明显升高，说明交易正在竞争 writable account 或全局区块空间。
+- 用户提现 SLA 要求较高，例如大额提现审批完成后、机构客户提现、风控放行后的补发交易。
+- 归集资金影响提现流动性，需要尽快把资金归到热钱包。
+- 创建 ATA、批量归集、多 instruction 交易 compute 消耗更高，且普通 base fee 广播确认延迟明显。
+
+不建议启用或继续提高 priority fee 的条件：
+
+- 主网停滞、slot 长时间不推进、RPC 多节点返回不一致。此时提高手续费不能解决 finality 风险，应暂停广播。
+- 业务单本身未通过风控、额度、KYT、人工审批或地址校验。
+- fee payer 余额低于安全阈值。
+- 交易失败原因是指令错误、余额不足、ATA/mint 不匹配、blockhash 过期或签名错误。此类问题应重构或修正交易，不应只加费。
+- priority fee 已达到币种、业务单或全局硬上限。
+
+### 10.5 如何提升 priority fee
+
+Solana 已签名交易的 message 包含 recent blockhash 和 Compute Budget instruction。要提升 priority fee，不能修改旧 rawtx 后继续使用旧签名，必须重新构建 message 并重新签名。
+
+自动提价流程：
+
+```text
+Built/Signed/Broadcast -> Pending
+Pending 且未过 last_valid_block_height:
+  继续查询 getSignatureStatuses，不并发创建第二笔同业务交易
+Pending 且 blockhash 过期，链上查无最终状态:
+  标记 Expired，释放旧 fee reservation
+  提高 priority 档位或 multiplier
+  获取新 blockhash
+  重构 message，重新签名
+  广播新 signature
+```
+
+提价规则建议：
+
+- 第 1 次构建：按业务默认档位，例如普通提现 `low`，大额提现 `medium`。
+- 第 1 次过期重签：提升一个档位，或将 `urgency_multiplier` 乘以 1.2 到 1.5。
+- 第 2 次过期重签：提升到 `high`，同时触发告警和人工可见。
+- 连续 3 次过期或状态不明：停止自动提价，进入人工处理，避免无上限烧 SOL。
+- 每次提价都必须重新执行余额检查、费用上限检查、签名前策略校验和签后反解析。
+
+并发控制：
+
+- 同一 `business_id` 只能有一个有效的 `Built/Signed/Broadcast/Pending` rawtx。
+- 旧 signature 未确认前，不允许直接广播同业务新交易，除非旧 blockhash 已过期且多节点确认链上无状态。
+- 对于 SOL 主币提现，同一 from account 的余额锁定必须覆盖 `amount + max_network_fee + account_creation_cost`，防止多笔交易互相抢余额。
+- 对于 SPL Token 提现，source token account 的 token 余额锁定和 fee payer 的 SOL 余额锁定必须分开。
+
+### 10.6 风控、监控和对账
+
+风控阈值：
+
+- 单笔 `max_network_fee_lamports`。
+- 单笔 `max_priority_fee_lamports`。
+- 单 CU `max_compute_unit_price_micro_lamports`。
+- 单日 fee payer 最大支出。
+- 单业务类型最大平均手续费。
+- 创建 ATA 的单日 rent 占用上限。
+
+监控指标：
+
+- `base_fee_lamports`、`priority_fee_lamports`、`network_fee_lamports`。
+- `compute_unit_limit`、`compute_unit_price_micro_lamports`、`compute_units_consumed`。
+- fee payer 可用余额、冻结余额、低余额告警次数。
+- 交易从广播到 confirmed/finalized 的耗时分布。
+- blockhash 过期次数、重签次数、提价次数。
+- 每个 RPC 返回的 priority fee 样本差异。
+
+对账要求：
+
+- 扫块以 `meta.fee` 作为链上实际 SOL 手续费。
+- fee payer 的 `preBalances/postBalances` 负向 delta 包含手续费，也可能包含 SOL 转账金额和账户创建 rent，必须按 instruction 和账户角色拆分。
+- 如果创建 ATA，rent-exempt lamports 是账户余额占用，不等同于消耗性 network fee；后续关闭账户退 rent 时要能对账。
+- Token-2022 transfer fee 影响 token 到账数量，应按 mint 扩展独立解析。
+- 每日按 fee payer 地址对链上余额变化、业务交易表、费用统计表做三方核对。
+
+### 10.7 数据模型建议
+
+提现表或 Solana 交易表建议补充：
+
+- `base_fee_lamports`
+- `priority_fee_lamports`
+- `max_fee_lamports`
+- `compute_unit_limit`
+- `compute_unit_price_micro_lamports`
+- `account_creation_cost_lamports`
+- `fee_policy_level`
+- `fee_quote_source`
+- `fee_quote_slot`
+- `retry_count`
+- `replacement_of_signature`
+
+可以单独建设手续费流水表：
+
+```sql
+CREATE TABLE `wallet_sol_fee_ledger` (
+    `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+    `chain` VARCHAR(20) NOT NULL DEFAULT 'SOL' COMMENT '链标识',
+    `business_id` BIGINT NOT NULL DEFAULT 0 COMMENT '业务单 ID',
+    `business_type` VARCHAR(32) NOT NULL DEFAULT '' COMMENT 'withdraw/sweep/create_ata 等',
+    `signature` VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'Solana 交易签名',
+    `fee_payer` VARCHAR(120) NOT NULL COMMENT '实际支付 SOL 手续费的地址',
+    `base_fee_lamports` VARCHAR(40) NOT NULL DEFAULT '0' COMMENT '基础手续费',
+    `priority_fee_lamports` VARCHAR(40) NOT NULL DEFAULT '0' COMMENT '优先费',
+    `network_fee_lamports` VARCHAR(40) NOT NULL DEFAULT '0' COMMENT '链上实际 meta.fee',
+    `account_creation_cost_lamports` VARCHAR(40) NOT NULL DEFAULT '0' COMMENT 'ATA/账户创建 rent 占用',
+    `compute_unit_limit` BIGINT NOT NULL DEFAULT 0 COMMENT '请求的 compute unit limit',
+    `compute_unit_price_micro_lamports` BIGINT NOT NULL DEFAULT 0 COMMENT '每 CU 优先费报价',
+    `compute_units_consumed` BIGINT NOT NULL DEFAULT 0 COMMENT '实际消耗 CU',
+    `fee_policy_level` VARCHAR(32) NOT NULL DEFAULT '' COMMENT 'none/low/medium/high/manual',
+    `status` TINYINT NOT NULL DEFAULT 0 COMMENT '0=Reserved 1=Finalized 2=Released 3=Manual',
+    `ctime` DATETIME NOT NULL COMMENT '记录创建时间',
+    `mtime` DATETIME NOT NULL COMMENT '记录更新时间',
+    KEY `idx_business` (`chain`, `business_type`, `business_id`),
+    KEY `idx_fee_payer` (`chain`, `fee_payer`),
+    KEY `idx_signature` (`chain`, `signature`)
+) ENGINE=InnoDB COMMENT='Solana 手续费流水表';
+```
 
 ## 11. 重组、finality 和历史事故
 
@@ -840,6 +1126,10 @@ SOL 主币不强制 memo。交易所首期建议：
 - Solana 官方文档：https://solana.com/docs
 - Solana JSON-RPC API：https://solana.com/docs/rpc
 - Solana 交易与费用文档：https://solana.com/docs/core/transactions
+- Solana Fee Structure：https://solana.com/docs/core/fees/fee-structure
+- Solana Compute Budget：https://solana.com/docs/core/fees/compute-budget
+- Solana getFeeForMessage：https://solana.com/docs/rpc/http/getfeeformessage
+- Solana getRecentPrioritizationFees：https://solana.com/docs/rpc/http/getrecentprioritizationfees
 - Solana 账户模型：https://solana.com/docs/core/accounts
 - Solana Token 文档：https://solana.com/docs/tokens
 - SPL Token Program：https://spl.solana.com/token
