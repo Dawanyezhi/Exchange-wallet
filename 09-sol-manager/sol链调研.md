@@ -1132,6 +1132,9 @@ SOL 主币不强制 memo。交易所首期建议：
 - Solana getRecentPrioritizationFees：https://solana.com/docs/rpc/http/getrecentprioritizationfees
 - Solana 账户模型：https://solana.com/docs/core/accounts
 - Solana Token 文档：https://solana.com/docs/tokens
+- Solana Go client 文档：https://solana.com/docs/clients/community/go
+- solana-go GitHub：https://github.com/solana-foundation/solana-go
+- solana-go Go package：https://pkg.go.dev/github.com/gagliardetto/solana-go
 - SPL Token Program：https://spl.solana.com/token
 - Associated Token Account Program：https://spl.solana.com/associated-token-account
 - Memo Program：https://spl.solana.com/memo
@@ -1145,7 +1148,362 @@ SOL 主币不强制 memo。交易所首期建议：
 - SolanaFM：https://solana.fm/
 - CoinMarketCap SOL：https://coinmarketcap.com/currencies/solana/
 
-## 14. 数据库设计建议
+## 14. Solana Go SDK：`github.com/gagliardetto/solana-go`
+
+官方资料确认：
+
+- Solana 官方开发者文档的 Go client 页面列出 `solana-go` 作为 Go SDK/客户端库。
+- GitHub 仓库当前在 `solana-foundation/solana-go`，但 Go module path 仍是 `github.com/gagliardetto/solana-go`。
+- SDK 覆盖 JSON-RPC、WebSocket、交易构建/序列化、System Program、SPL Token、Associated Token Account、Memo、Address Lookup Table 等常用能力。
+
+工程建议：
+
+- 本项目 `go.mod` 目前声明 `go 1.22`。`solana-go` 新版本可能要求更高 Go 版本，例如 v1.20.0 的 `go.mod` 声明 `go 1.24.0`。接入前必须固定可兼容版本，或先统一升级本项目 Go 工具链。
+- 生产钱包可以使用 SDK 构建交易、解析交易、调用 RPC、计算 ATA、构造 SPL Token 指令，但不能把 SDK 的 `PrivateKey`/`Wallet` 当作生产私钥托管方案。热钱包私钥、冷钱包私钥和签名策略仍应在 keyman/HSM/MPC 边界内完成。
+- 交易所接入时不要只依赖 `SendAndConfirmTransaction` 一类便利方法。提现状态机仍要自己落库 `rawtx`、`signature`、`recent_blockhash`、`last_valid_block_height`，并用多节点 `getSignatureStatuses/getTransaction/getBlock` 做补偿确认。
+
+### 14.1 安装和版本选择
+
+当前仓库 Go 版本为 1.22，建议先验证 SDK 版本要求：
+
+```bash
+go list -m -versions github.com/gagliardetto/solana-go
+go mod download github.com/gagliardetto/solana-go@<version>
+go mod why github.com/gagliardetto/solana-go
+```
+
+如果使用 Go 1.22，应选择 `go.mod` 不要求更高 Go 版本的 `solana-go` 版本；如果要使用最新 SDK，则先把本项目 Go 工具链、CI、GVM、`go.mod` 统一升级，避免出现 `go` 二进制和 `GOROOT` 版本混用导致测试不可运行。
+
+示例依赖：
+
+```bash
+go get github.com/gagliardetto/solana-go@<pinned-version>
+```
+
+不要在生产服务里无锁定地使用 `@latest`。Solana RPC、交易版本、Token-2022 和 SDK API 都在演进，版本升级需要回归以下场景：
+
+- SOL 主币提现构建、签名、签后反解析。
+- SPL Token `TransferChecked`。
+- ATA 创建和已存在 ATA 的幂等处理。
+- v0 transaction 和 Address Lookup Table 解析。
+- `getBlock/getTransaction` 对 `jsonParsed/base64` 的兼容性。
+- `getSignatureStatuses`、`simulateTransaction` 和 `sendTransaction` 错误处理。
+
+### 14.2 常用包
+
+| 包 | 常用能力 | 钱包使用场景 |
+|----|----------|--------------|
+| `github.com/gagliardetto/solana-go` | `PublicKey`、`PrivateKey`、`Signature`、`Hash`、交易构建、序列化、反序列化 | 地址校验、message 构建、raw tx 解析、签名验证 |
+| `github.com/gagliardetto/solana-go/rpc` | JSON-RPC client | 余额、区块、交易、签名状态、费用、blockhash 查询 |
+| `github.com/gagliardetto/solana-go/rpc/ws` | WebSocket client | signature/account/logs/slot 订阅，生产仅作辅助 |
+| `github.com/gagliardetto/solana-go/programs/system` | System Program 指令 | SOL 主币提现、归集 |
+| `github.com/gagliardetto/solana-go/programs/token` | SPL Token 指令和账户结构 | Token 转账、Mint/Token Account 解码 |
+| `github.com/gagliardetto/solana-go/programs/associated-token-account` | ATA 创建指令 | 提现前创建目标 ATA |
+| `github.com/gagliardetto/solana-go/programs/compute-budget` | Compute Budget 指令 | 设置 compute unit limit 和 priority fee |
+| `github.com/gagliardetto/binary` | Borsh/bin 解码 | Token account、Mint、instruction data 解码 |
+
+### 14.3 地址、公钥和签名类型
+
+常用方法：
+
+- `solana.PublicKeyFromBase58(addr)`：解析并校验 base58 公钥。
+- `solana.MustPublicKeyFromBase58(addr)`：解析失败会 panic，只适合常量或测试。
+- `pubkey.String()`：输出 base58 地址。
+- `solana.SignatureFromBase58(sig)` / `solana.MustSignatureFromBase58(sig)`：解析交易签名。
+- `solana.HashFromBase58(hash)` / `solana.MustHashFromBase58(hash)`：解析 blockhash。
+- `solana.NewWallet()`、`solana.NewRandomPrivateKey()`、`solana.PrivateKeyFromBase58()`：适合 demo、测试、本地工具；生产不建议让业务服务直接持有私钥。
+
+验址示例：
+
+```go
+package solwallet
+
+import "github.com/gagliardetto/solana-go"
+
+func ParseSOLAddress(addr string) (solana.PublicKey, error) {
+	return solana.PublicKeyFromBase58(addr)
+}
+```
+
+生产注意点：
+
+- `PublicKeyFromBase58` 只能证明是 32 字节公钥格式，不能证明它是普通用户钱包、System Account、ATA 或 PDA。
+- 提现到 SPL Token Account 时，还必须链上查 `owner/mint/token program id`。
+- 如果业务禁止提现到 PDA，需要单独设计策略校验，不能只靠 base58 解析。
+
+### 14.4 RPC Client 常用方法
+
+初始化：
+
+```go
+rpcClient := rpc.New(rpc.MainNetBeta_RPC)
+// 或使用自有 RPC / 供应商 RPC。
+rpcClient := rpc.New("https://api.mainnet-beta.solana.com")
+
+// 供应商需要 API key 时：
+rpcClient := rpc.NewWithHeaders(endpoint, map[string]string{
+	"x-api-key": apiKey,
+})
+```
+
+生产建议使用自定义 HTTP client 设置超时、连接池、限流和请求头，避免公共 RPC 限流影响充值和提现状态补偿。
+
+常用查询：
+
+```go
+latest, err := rpcClient.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+slot, err := rpcClient.GetSlot(ctx, rpc.CommitmentFinalized)
+balance, err := rpcClient.GetBalance(ctx, pubkey, rpc.CommitmentFinalized)
+account, err := rpcClient.GetAccountInfoWithOpts(ctx, pubkey, &rpc.GetAccountInfoOpts{
+	Encoding:   solana.EncodingBase64,
+	Commitment: rpc.CommitmentFinalized,
+})
+```
+
+交易和扫块：
+
+```go
+version := uint64(0)
+block, err := rpcClient.GetBlockWithOpts(ctx, slot, &rpc.GetBlockOpts{
+	Encoding:                       solana.EncodingBase64,
+	TransactionDetails:             rpc.TransactionDetailsFull,
+	Rewards:                        rpc.NewBoolean(false),
+	Commitment:                     rpc.CommitmentFinalized,
+	MaxSupportedTransactionVersion: &version,
+})
+
+tx, err := rpcClient.GetTransaction(ctx, signature, &rpc.GetTransactionOpts{
+	Encoding:                       solana.EncodingBase64,
+	MaxSupportedTransactionVersion: &version,
+})
+
+statuses, err := rpcClient.GetSignatureStatuses(ctx, true, signature)
+```
+
+费用、模拟和广播：
+
+```go
+fee, err := rpcClient.GetFeeForMessage(ctx, base64Message, rpc.CommitmentFinalized)
+priorities, err := rpcClient.GetRecentPrioritizationFees(ctx, []solana.PublicKey{feePayer})
+sim, err := rpcClient.SimulateTransaction(ctx, tx)
+sig, err := rpcClient.SendTransactionWithOpts(ctx, tx, rpc.TransactionOpts{
+	SkipPreflight:       false,
+	PreflightCommitment: rpc.CommitmentFinalized,
+})
+```
+
+关键边界：
+
+- `sendTransaction` 成功只表示 RPC 接受，不表示交易已确认或最终成功。
+- `GetLatestBlockhash` 返回的 `LastValidBlockHeight` 必须落库；过期后不能重播旧 rawtx。
+- `GetBlockWithOpts` 对历史 slot 可能返回 unavailable，生产需要归档 RPC 或索引器补偿。
+- `jsonParsed` 便于开发，但生产解析建议同时支持 base64 raw transaction，避免部分 program 没有 parsed parser。
+
+### 14.5 SOL 主币转账构建
+
+SDK 可用 `system.NewTransferInstruction` 构造 System Program transfer：
+
+```go
+package soltx
+
+import (
+	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/programs/system"
+)
+
+func BuildSOLTransfer(
+	feePayer solana.PublicKey,
+	from solana.PublicKey,
+	to solana.PublicKey,
+	lamports uint64,
+	recentBlockhash solana.Hash,
+) (*solana.Transaction, error) {
+	return solana.NewTransaction(
+		[]solana.Instruction{
+			system.NewTransferInstruction(
+				lamports,
+				from,
+				to,
+			).Build(),
+		},
+		recentBlockhash,
+		solana.TransactionPayer(feePayer),
+	)
+}
+```
+
+如果 `feePayer == from`，单签即可；如果 fee payer 和 source 分离，要确认交易 signer 列表、签名顺序和签名机策略都允许该组合。
+
+签名前必须检查：
+
+- `tx.Message.AccountKeys[0]` 是否为期望 fee payer。
+- instruction program id 是否只有 System Program 和可选 Compute Budget。
+- transfer 的 from、to、lamports 是否与提现单完全一致。
+- `recentBlockhash` 和 `lastValidBlockHeight` 是否来自可信 RPC 且未过期。
+
+### 14.6 SDK 签名方式与生产签名边界
+
+SDK 内置签名方法：
+
+```go
+_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+	if key.Equals(privateKey.PublicKey()) {
+		return &privateKey
+	}
+	return nil
+})
+
+err = tx.VerifySignatures()
+rawBase64 := tx.MustToBase64()
+```
+
+这适合 demo 和本地工具。生产签名流程建议拆开：
+
+1. 钱包服务用 SDK 构建 unsigned transaction。
+2. 调用 `tx.Message.MarshalBinary()` 得到 Solana 实际签名对象 message bytes。
+3. 钱包服务把 message bytes、业务上下文、允许 program、fee 上限、目标地址、金额、mint 等传给 keyman。
+4. keyman 反解析 message bytes 并执行策略校验后，用 ed25519 签名。
+5. 钱包服务把签名填回 transaction，执行 `VerifySignatures()` 和签后反解析，再模拟和广播。
+
+关键点：
+
+- Solana ed25519 签名对象是 message bytes，不是业务服务预先计算好的任意 hash。
+- 不要让 keyman 盲签 `tx.Message.MarshalBinary()`；keyman 自己也要解析并校验 message 内容。
+- 广播前要保存 raw tx base64、第一签名、message hash、blockhash 和 last valid block height。
+
+### 14.7 SPL Token 与 ATA 常用方法
+
+ATA 计算：
+
+```go
+ata, _, err := solana.FindAssociatedTokenAddress(owner, mint)
+```
+
+创建 ATA instruction：
+
+```go
+createATA := associatedtokenaccount.NewCreateInstruction(
+	feePayer,
+	owner,
+	mint,
+).Build()
+```
+
+SPL Token 提现建议使用 `TransferChecked`，它会把 mint 和 decimals 放进 instruction，便于签名机校验：
+
+```go
+transfer := token.NewTransferCheckedInstruction(
+	amount,
+	decimals,
+	sourceTokenAccount,
+	mint,
+	destinationTokenAccount,
+	owner,
+	nil,
+).Build()
+```
+
+构造交易时，如果目标 ATA 不存在，可以把 `createATA` 放在 `transfer` 前面：
+
+```go
+tx, err := solana.NewTransaction(
+	[]solana.Instruction{
+		createATA,
+		transfer,
+	},
+	recentBlockhash,
+	solana.TransactionPayer(feePayer),
+)
+```
+
+生产校验：
+
+- `sourceTokenAccount` 必须是我方 owner 控制的 token account，且 mint 匹配。
+- `destinationTokenAccount` 必须属于提现目标 owner，且 mint 匹配；不要只信用户填写的 token account 地址。
+- `amount` 是 token 最小单位整数，`decimals` 必须来自资产配置并定期和链上 mint 对账。
+- 创建 ATA 的 rent 成本要单独记账，不能混入 token 提现金额。
+- Token-2022 可能启用 transfer fee、memo required、non-transferable 等扩展；首期如不支持，应按 mint 白名单拒绝。
+
+Token 账户查询：
+
+```go
+balance, err := rpcClient.GetTokenAccountBalance(ctx, tokenAccount, rpc.CommitmentFinalized)
+accounts, err := rpcClient.GetTokenAccountsByOwner(
+	ctx,
+	owner,
+	&rpc.GetTokenAccountsConfig{Mint: mint.ToPointer()},
+	&rpc.GetTokenAccountsOpts{Encoding: solana.EncodingBase64},
+)
+```
+
+### 14.8 交易解析与 instruction 解码
+
+解析已保存的 raw tx：
+
+```go
+tx, err := solana.TransactionFromBase64(rawBase64)
+if err != nil {
+	return err
+}
+
+err = tx.VerifySignatures()
+```
+
+遍历 instruction 并解码：
+
+```go
+for _, compiled := range tx.Message.Instructions {
+	programID, err := tx.ResolveProgramIDIndex(compiled.ProgramIDIndex)
+	if err != nil {
+		return err
+	}
+	accounts, err := compiled.ResolveInstructionAccounts(&tx.Message)
+	if err != nil {
+		return err
+	}
+	decoded, err := solana.DecodeInstruction(programID, accounts, compiled.Data)
+	if err != nil {
+		continue
+	}
+	_ = decoded
+}
+```
+
+注意：
+
+- `solana-go` 会为已支持 program 注册 decoder，但未知 program 仍需要按官方 layout 或 IDL 自行解码。
+- v0 transaction 需要解析 Address Lookup Table 后才能完整还原账户下标。扫块服务遇到 v0 交易时，要设置 `MaxSupportedTransactionVersion`，并在需要时解析 loaded addresses。
+- 对充值解析，不能只看 instruction。SOL 需要结合 `preBalances/postBalances`，SPL Token 需要结合 `preTokenBalances/postTokenBalances`，并过滤 `meta.err != null`。
+
+### 14.9 WebSocket 使用边界
+
+SDK 的 `rpc/ws` 支持：
+
+- `SignatureSubscribe`：订阅单笔交易状态。
+- `AccountSubscribe`：订阅账户变化。
+- `LogsSubscribe` / `LogsSubscribeMentions`：订阅日志。
+- `SlotSubscribe` / `RootSubscribe`：订阅 slot/root 推进。
+
+工程建议：
+
+- WebSocket 只适合作为提现快速反馈或监控信号，不应作为唯一入账依据。
+- 充值入账仍应以 finalized slot 扫块和交易状态补偿为准。
+- WS 断线、重复消息、乱序和供应商限流都要做幂等处理。
+
+### 14.10 接入本项目的建议封装
+
+建议在生产化时封装 `internal/solana` 或 `09-sol-manager/solsdk`，不要在业务层到处直接调用 SDK：
+
+- `ParseAddress(addr string) (PublicKey, error)`：统一验址和 PDA 策略。
+- `BuildSOLTransfer(req) (*UnsignedTx, error)`：输出 message bytes、summary、blockhash、last valid height。
+- `BuildSPLTransferChecked(req) (*UnsignedTx, error)`：封装 ATA 查询/创建策略和 `TransferChecked`。
+- `DecodeSignedTransaction(rawBase64 string) (*TxSummary, error)`：签后反解析和审计。
+- `FetchFinalizedBlock(slot uint64) (*Block, error)`：统一 `getBlock` 参数、版本、重试和错误分类。
+- `FetchSignatureStatus(signature string) (*Status, error)`：统一状态补偿。
+
+SDK 能减少手写 Solana 编码的风险，但不能替代钱包业务校验。最终安全边界仍然是：资产配置白名单、金额整数精度、instruction 白名单、签名前策略、签后反解析、多节点确认、状态机幂等和对账。
+
+## 15. 数据库设计建议
 
 现有表存在 EVM 假设：
 
@@ -1154,7 +1512,7 @@ SOL 主币不强制 memo。交易所首期建议：
 - `nonce` 对普通 Solana 交易无意义。
 - Token 充值不能只靠 `to` 地址，需要 token account、owner、mint、instruction index。
 
-### 14.1 地址表调整
+### 15.1 地址表调整
 
 建议多链地址字段统一放宽：
 
@@ -1166,7 +1524,7 @@ derivation_path VARCHAR(120) NOT NULL DEFAULT '' COMMENT 'HD 派生路径；Sola
 
 Solana 公钥 32 字节，地址为 base58。
 
-### 14.2 Solana slot 扫描状态表
+### 15.2 Solana slot 扫描状态表
 
 `wallet_sol_slots` 记录每个已处理或异常的 slot。未出现记录表示尚未扫描，不需要提前插入 `Pending`。
 
@@ -1192,7 +1550,7 @@ CREATE TABLE `wallet_sol_slots` (
 - `Retry`：临时失败，例如 RPC 超时、限流、节点落后，等待重试。
 - `Failed`：多次重试仍失败，需要切换节点或人工处理。
 
-### 14.3 Solana block 索引表
+### 15.3 Solana block 索引表
 
 `wallet_sol_blocks` 只记录真实产出 block 的 slot。skipped slot 不写入该表。
 
@@ -1214,7 +1572,7 @@ CREATE TABLE `wallet_sol_blocks` (
 ) ENGINE=InnoDB COMMENT='Solana block 索引表';
 ```
 
-### 14.4 Solana 交易表
+### 15.4 Solana 交易表
 
 ```sql
 CREATE TABLE `wallet_sol_txs` (
@@ -1240,7 +1598,7 @@ CREATE TABLE `wallet_sol_txs` (
 ) ENGINE=InnoDB COMMENT='Solana 交易索引表';
 ```
 
-### 14.5 Solana instruction 表
+### 15.5 Solana instruction 表
 
 ```sql
 CREATE TABLE `wallet_sol_instructions` (
@@ -1267,7 +1625,7 @@ CREATE TABLE `wallet_sol_instructions` (
 ) ENGINE=InnoDB COMMENT='Solana 指令解析明细';
 ```
 
-### 14.6 SPL Token 账户表
+### 15.6 SPL Token 账户表
 
 ```sql
 CREATE TABLE `wallet_sol_token_accounts` (
@@ -1289,7 +1647,7 @@ CREATE TABLE `wallet_sol_token_accounts` (
 ) ENGINE=InnoDB COMMENT='Solana SPL Token Account/ATA 归属表';
 ```
 
-### 14.7 扫链落库顺序
+### 15.7 扫链落库顺序
 
 生产建议按批次调用 `getBlocks(start_slot, end_slot, finalized)`，返回值是实际产出 block 的 slot 列表。只有当本批次 RPC 查询成功、范围已经 finalized、节点健康时，未返回的 slot 才能按 skipped 处理。
 
@@ -1323,7 +1681,7 @@ Parsed:  100, 103, 104, 108
 Skipped: 101, 102, 105, 106, 107, 109, 110
 ```
 
-### 14.8 Solana Token 充值唯一键
+### 15.8 Solana Token 充值唯一键
 
 建议 `wallet_inbound` 对 Solana 扩展或新增链特定表：
 
@@ -1339,9 +1697,9 @@ UNIQUE(chain, signature, instruction_index, to)
 
 不要只用 `hash + to`，因为同一交易内可能多个 instruction 命中同一地址或多个 token account。
 
-## 15. 交易示例：如何转成充值记录
+## 16. 交易示例：如何转成充值记录
 
-### 15.1 SOL 主币充值
+### 16.1 SOL 主币充值
 
 交易包含 System Program transfer：
 
@@ -1380,7 +1738,7 @@ uid=<用户ID>
 status=Pending/Success 取决于 finalized 策略
 ```
 
-### 15.2 SPL Token 充值
+### 16.2 SPL Token 充值
 
 交易包含 Token Program `transferChecked`：
 
@@ -1408,7 +1766,7 @@ status=Pending/Success 取决于 finalized 策略
 4. 用 post-pre 计算到账最小单位：`25000000`。
 5. 插入 `wallet_inbound` 或 Solana Token 充值扩展表。
 
-## 16. 对账设计
+## 17. 对账设计
 
 SOL 主币：
 
@@ -1430,9 +1788,9 @@ SPL Token：
 - 提现 signature 长时间无 finalized 状态。
 - blockhash 过期但业务单仍处于待广播/待确认。
 
-## 17. 对本项目的落地建议
+## 18. 对本项目的落地建议
 
-### 17.1 coinset 配置
+### 18.1 coinset 配置
 
 建议在 `internal/coinset` 增加 Solana 特性：
 
@@ -1461,7 +1819,7 @@ SOL = Chain{
 
 注意：当前 `Confirms` 用 `SafeHeight = back - confirms` 表达 EVM 确认数，对 Solana 不完全贴切。更好的方式是在 `Chain` 中增加 finality/commitment 配置，或通过 FeatureGate 让 Solana syncer 使用 `finalized` slot 作为安全高度。
 
-### 17.2 模块拆分
+### 18.2 模块拆分
 
 建议围绕 `09-sol-manager/tx-sign-send/` 和 `09-sol-manager/block-tx-parser/` 分阶段实现：
 
@@ -1473,7 +1831,7 @@ SOL = Chain{
 6. Memo 模式充值归属和漏填处理。
 7. 多节点 finalized slot 对账和提现状态补偿。
 
-### 17.3 最小生产闭环
+### 18.3 最小生产闭环
 
 首期建议支持：
 
@@ -1492,7 +1850,7 @@ SOL = Chain{
 - 共享地址 + memo 模式，除非业务强需求。
 - 依赖单一公共 RPC 作为唯一记账来源。
 
-## 18. 生产安全清单
+## 19. 生产安全清单
 
 - ed25519 派生和签名与 EVM secp256k1 完全隔离。
 - 地址字段、signature 字段长度已放宽。

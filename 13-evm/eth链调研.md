@@ -479,7 +479,415 @@ ERC20 提现成功确认：
 - 对归档能力做明确选择：普通 ETH/ERC20 近期扫链不一定需要 archive，但历史重扫、任意旧高度 `eth_call`、审计补偿可能需要 archive 或自建索引快照。
 - 节点落后、返回链 ID 不一致、parentHash 不连续、receipt 缺失率异常、`safe/finalized` 停滞都要告警并触发暂停策略。
 
-## 11. 数据模型建议
+## 11. Go SDK：github.com/ethereum/go-ethereum 常用方法和使用方式
+
+本仓库当前已依赖 `github.com/ethereum/go-ethereum v1.14.8`。它不是单纯的“ETH SDK”，而是 Geth 项目提供的 Go 包集合：`ethclient` 封装标准 JSON-RPC，`core/types` 提供交易和 receipt 类型，`accounts/abi` 提供 ABI 编解码，`crypto` 提供 Keccak/secp256k1 工具，`common` 提供地址和 hash 类型。
+
+工程建议：
+
+- 交易所钱包服务可使用 `ethclient` 做扫链、余额、receipt、logs、广播和 gas 估算。
+- 交易构建和签名建议使用 `types.DynamicFeeTx`、`types.NewTx`、`types.SignTx`、`types.Sender`、`tx.MarshalBinary`、`tx.UnmarshalBinary`。
+- ERC20 calldata、event、`balanceOf` 建议使用 `accounts/abi` 编解码，不要手写拼接业务关键字段。
+- 私钥只应在 demo 或离线签名服务内部出现。生产钱包服务不要调用 `crypto.HexToECDSA` 加载热钱包私钥；应把 unsigned tx 和策略断言交给 HSM/MPC/keyman，签后再反解析 raw tx。
+- `ethclient` 没有“按地址交易历史”方法，这与官方 JSON-RPC 能力一致。生产入账仍必须自建扫块和 logs 索引。
+
+### 11.1 常用包
+
+| 包 | 常见用途 | 钱包使用建议 |
+|----|----------|--------------|
+| `github.com/ethereum/go-ethereum/ethclient` | 标准 ETH JSON-RPC typed client | 扫块、receipt、logs、余额、广播、gas 估算 |
+| `github.com/ethereum/go-ethereum/rpc` | 底层 JSON-RPC client | 调用 `safe/finalized` 标签、批量请求、debug/trace/client-specific 方法 |
+| `github.com/ethereum/go-ethereum/common` | `Address`、`Hash`、hex 工具 | 地址/hash 规范化，避免字符串到处传 |
+| `github.com/ethereum/go-ethereum/core/types` | `Transaction`、`Receipt`、`Log`、`DynamicFeeTx` | 构建、签名、反解析、恢复 signer、解析 receipt |
+| `github.com/ethereum/go-ethereum/accounts/abi` | 合约 ABI 编解码 | ERC20 `transfer`、`balanceOf`、`Transfer` event |
+| `github.com/ethereum/go-ethereum/crypto` | Keccak、secp256k1、地址推导 | demo 签名、event signature、地址生成；生产私钥操作放签名服务 |
+| `github.com/ethereum/go-ethereum` | `CallMsg`、`FilterQuery` 等通用结构 | `eth_call`、`eth_estimateGas`、`eth_getLogs` 参数 |
+| `github.com/ethereum/go-ethereum/accounts/abi/bind` | 合约绑定和 abigen 支持 | 可用于内部工具；托管钱包核心链路更建议显式 ABI 编解码和策略校验 |
+
+### 11.2 ethclient 常用方法
+
+| 场景 | 方法 | 使用方式 | 生产注意点 |
+|------|------|----------|------------|
+| 建立连接 | `ethclient.DialContext(ctx, url)`、`client.Close()` | 启动时创建 RPC client，配置超时、重试、连接池 | 不要单 RPC；链 ID 和高度要多节点比对 |
+| 校验链 | `client.ChainID(ctx)` | 对应 `eth_chainId` | 启动、定时巡检、广播前都校验 |
+| 同步状态 | `client.SyncProgress(ctx)`、`client.BlockNumber(ctx)` | 判断节点是否落后 | 节点落后超过阈值暂停入账/出账 |
+| 区块头 | `client.HeaderByNumber(ctx, n)`、`client.HeaderByHash(ctx, h)` | 保存 `number/hash/parentHash/time/baseFee` | `nil` 表示 latest；safe/finalized 建议用底层 `rpc.Client` 明确调用 |
+| 完整区块 | `client.BlockByNumber(ctx, n)`、`client.BlockByHash(ctx, h)` | 扫块获取交易列表 | 大块扫描要做超时、分页任务和断点续扫 |
+| 区块 receipts | `client.BlockReceipts(ctx, rpc.BlockNumberOrHashWithNumber(...))` | 一次拉某块 receipts | 供应商/客户端支持需实测；失败时回退逐笔 `TransactionReceipt` |
+| 交易详情 | `client.TransactionByHash(ctx, txHash)` | 查询广播交易或补偿扫描 | 返回 `isPending` 只代表当前节点视图 |
+| Receipt | `client.TransactionReceipt(ctx, txHash)` | 判断 `status`、`gasUsed`、`effectiveGasPrice`、logs | `ethereum.NotFound` 表示未上链或节点未知，不等于交易失败 |
+| 广播 | `client.SendTransaction(ctx, signedTx)` | 对应 `eth_sendRawTransaction` | 广播前必须保存 raw tx；already known 可按幂等处理 |
+| 余额 | `client.BalanceAt(ctx, addr, blockNumber)` | ETH 对账 | 生产对账指定高度或 block hash，避免边扫边变 |
+| ERC20 余额 | `client.CallContract(ctx, ethereum.CallMsg{To:&token, Data:data}, blockNumber)` | 调用 `balanceOf(address)` | 合约异常返回要进入对账异常，不要静默按 0 处理 |
+| nonce | `client.NonceAt(ctx, addr, nil)`、`client.PendingNonceAt(ctx, addr)` | 初始化/补偿本地 nonce 状态 | 生产分配 nonce 以本地 DB 锁为准，不逐笔信 pending |
+| gas 估算 | `client.EstimateGas(ctx, ethereum.CallMsg{From:from, To:&to, Value:value, Data:data})` | ERC20/合约转账估算 gas limit | 估算值只做参考，要加 buffer 和上限 |
+| 费用建议 | `client.FeeHistory(ctx, blocks, nil, rewards)`、`client.SuggestGasTipCap(ctx)`、`client.SuggestGasPrice(ctx)` | EIP-1559 fee quote | 主网优先 `FeeHistory`；legacy 链再用 `SuggestGasPrice` |
+| logs | `client.FilterLogs(ctx, ethereum.FilterQuery{FromBlock:..., ToBlock:..., Addresses:..., Topics:...})` | 按 token/topic 扫 ERC20 Transfer | 查询跨度要控；仍要结合区块 hash 和 reorg 回滚 |
+| 订阅 | `client.SubscribeNewHead`、`client.SubscribeFilterLogs` | 实时提示新块/logs | 只能做触发器，不能替代确定性扫块 |
+
+`safe`、`finalized`、trace、批量 RPC 等 `ethclient` 未完整封装或需要特殊参数时，可以使用底层 client：
+
+```go
+raw := client.Client()
+var header types.Header
+err := raw.CallContext(ctx, &header, "eth_getBlockByNumber", "finalized", false)
+if err != nil {
+    return err
+}
+```
+
+### 11.3 初始化 RPC 和校验 chain id
+
+```go
+package evm
+
+import (
+    "context"
+    "fmt"
+    "math/big"
+    "time"
+
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func dialETH(ctx context.Context, rpcURL string, wantChainID int64) (*ethclient.Client, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    client, err := ethclient.DialContext(ctx, rpcURL)
+    if err != nil {
+        return nil, err
+    }
+
+    chainID, err := client.ChainID(ctx)
+    if err != nil {
+        client.Close()
+        return nil, err
+    }
+    if chainID.Cmp(big.NewInt(wantChainID)) != 0 {
+        client.Close()
+        return nil, fmt.Errorf("evm chain id mismatch: got %s want %d", chainID, wantChainID)
+    }
+    return client, nil
+}
+```
+
+生产落地时，`rpcURL` 不能只配一个。建议封装 `EVMRPC`，对 `ChainID`、`BlockNumber`、`HeaderByNumber`、`TransactionReceipt` 做多节点交叉校验，对 `SendTransaction` 做主备广播和幂等错误归一化。
+
+### 11.4 构建 EIP-1559 ETH 转账并签名
+
+demo 可直接使用私钥签名：
+
+```go
+package evm
+
+import (
+    "context"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/ethereum/go-ethereum/crypto"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func buildSignETHTransfer(ctx context.Context, client *ethclient.Client, privateKeyHex string, to common.Address, valueWei *big.Int) (*types.Transaction, []byte, error) {
+    privateKey, err := crypto.HexToECDSA(privateKeyHex)
+    if err != nil {
+        return nil, nil, err
+    }
+    from := crypto.PubkeyToAddress(privateKey.PublicKey)
+
+    chainID, err := client.ChainID(ctx)
+    if err != nil {
+        return nil, nil, err
+    }
+    nonce, err := client.PendingNonceAt(ctx, from)
+    if err != nil {
+        return nil, nil, err
+    }
+    tipCap, err := client.SuggestGasTipCap(ctx)
+    if err != nil {
+        return nil, nil, err
+    }
+    header, err := client.HeaderByNumber(ctx, nil)
+    if err != nil {
+        return nil, nil, err
+    }
+
+    gasLimit := uint64(21000)
+    feeCap := new(big.Int).Add(new(big.Int).Mul(header.BaseFee, big.NewInt(2)), tipCap)
+    tx := types.NewTx(&types.DynamicFeeTx{
+        ChainID:   chainID,
+        Nonce:     nonce,
+        GasTipCap: tipCap,
+        GasFeeCap: feeCap,
+        Gas:       gasLimit,
+        To:        &to,
+        Value:     valueWei,
+        Data:      nil,
+    })
+
+    signer := types.LatestSignerForChainID(chainID)
+    signedTx, err := types.SignTx(tx, signer, privateKey)
+    if err != nil {
+        return nil, nil, err
+    }
+    rawTx, err := signedTx.MarshalBinary()
+    if err != nil {
+        return nil, nil, err
+    }
+    return signedTx, rawTx, nil
+}
+```
+
+生产签名服务不应使用上面这种“钱包服务持私钥”的写法。正确流程是：
+
+1. 钱包服务用本地 nonce 锁、fee quote、业务单构造 unsigned tx。
+2. 钱包服务把 unsigned tx、key id、业务断言提交签名服务。
+3. 签名服务解析 `DynamicFeeTx` 并做策略校验后签名。
+4. 钱包服务用 `UnmarshalBinary`、`types.Sender`、ABI 解码做签后反校验。
+5. raw tx 落库后再 `SendTransaction` 广播。
+
+### 11.5 构建 ERC20 transfer calldata 和估算 gas
+
+```go
+package evm
+
+import (
+    "context"
+    "math/big"
+    "strings"
+
+    "github.com/ethereum/go-ethereum"
+    "github.com/ethereum/go-ethereum/accounts/abi"
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+const erc20ABIJSON = `[
+  {"name":"transfer","type":"function","inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"name":"","type":"bool"}]},
+  {"name":"balanceOf","type":"function","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"","type":"uint256"}]},
+  {"name":"Transfer","type":"event","inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}
+]`
+
+func buildERC20TransferTx(ctx context.Context, client *ethclient.Client, chainID *big.Int, from common.Address, token common.Address, recipient common.Address, amount *big.Int, nonce uint64, tipCap *big.Int, feeCap *big.Int) (*types.Transaction, error) {
+    tokenABI, err := abi.JSON(strings.NewReader(erc20ABIJSON))
+    if err != nil {
+        return nil, err
+    }
+    data, err := tokenABI.Pack("transfer", recipient, amount)
+    if err != nil {
+        return nil, err
+    }
+
+    gasLimit, err := client.EstimateGas(ctx, ethereum.CallMsg{
+        From:  from,
+        To:    &token,
+        Value: big.NewInt(0),
+        Data:  data,
+    })
+    if err != nil {
+        return nil, err
+    }
+
+    gasLimit = gasLimit + gasLimit/3
+    if gasLimit > 200000 {
+        gasLimit = 200000
+    }
+
+    return types.NewTx(&types.DynamicFeeTx{
+        ChainID:   chainID,
+        Nonce:     nonce,
+        GasTipCap: tipCap,
+        GasFeeCap: feeCap,
+        Gas:       gasLimit,
+        To:        &token,
+        Value:     big.NewInt(0),
+        Data:      data,
+    }), nil
+}
+```
+
+签名前必须再解析 `tx.Data()`：
+
+```go
+method, err := tokenABI.MethodById(tx.Data()[:4])
+if err != nil {
+    return err
+}
+if method.Name != "transfer" {
+    return fmt.Errorf("unsupported erc20 method: %s", method.Name)
+}
+args, err := method.Inputs.Unpack(tx.Data()[4:])
+if err != nil {
+    return err
+}
+tokenTo := args[0].(common.Address)
+tokenAmount := args[1].(*big.Int)
+```
+
+生产规则仍然是：`tx.To()` 必须是白名单 token 合约，`tx.Value()==0`，calldata 中的 `recipient/amount` 必须等于业务单，`gasLimit * feeCap` 不得超过手续费上限。
+
+### 11.6 签后 raw tx 反解析、恢复 signer 和广播
+
+```go
+package evm
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+func parseVerifyBroadcast(ctx context.Context, client *ethclient.Client, rawTx []byte, wantFrom common.Address, wantChainID string) (common.Hash, error) {
+    var tx types.Transaction
+    if err := tx.UnmarshalBinary(rawTx); err != nil {
+        return common.Hash{}, err
+    }
+
+    if tx.ChainId().String() != wantChainID {
+        return common.Hash{}, fmt.Errorf("chain id mismatch: %s", tx.ChainId())
+    }
+    signer := types.LatestSignerForChainID(tx.ChainId())
+    from, err := types.Sender(signer, &tx)
+    if err != nil {
+        return common.Hash{}, err
+    }
+    if from != wantFrom {
+        return common.Hash{}, fmt.Errorf("signer mismatch: got %s want %s", from.Hex(), wantFrom.Hex())
+    }
+
+    // 落库 raw tx、tx.Hash()、nonce、fee caps、业务单号后再广播。
+    if err := client.SendTransaction(ctx, &tx); err != nil {
+        return common.Hash{}, err
+    }
+    return tx.Hash(), nil
+}
+```
+
+注意：
+
+- `types.LatestSignerForChainID` 会按 chain id 选择支持当前交易类型的 signer。签名和恢复 signer 必须使用同一个 chain id。
+- `MarshalBinary` 得到的 bytes 转十六进制后就是 `eth_sendRawTransaction` 的 raw tx。
+- `tx.Hash()` 是已签名交易 hash；unsigned tx 没有最终 tx hash。
+- 广播错误需要归一化处理，例如 already known、replacement underpriced、nonce too low、insufficient funds、fee cap less than block base fee，并进入对应状态机。
+
+### 11.7 扫块、receipt 和 ERC20 Transfer logs 解析
+
+```go
+package evm
+
+import (
+    "context"
+    "math/big"
+
+    "github.com/ethereum/go-ethereum"
+    "github.com/ethereum/go-ethereum/common"
+    "github.com/ethereum/go-ethereum/core/types"
+    "github.com/ethereum/go-ethereum/crypto"
+    "github.com/ethereum/go-ethereum/ethclient"
+)
+
+var erc20TransferTopic = crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))
+
+func scanBlock(ctx context.Context, client *ethclient.Client, height uint64, tokenWhitelist map[common.Address]bool, myAddresses map[common.Address]bool) error {
+    block, err := client.BlockByNumber(ctx, new(big.Int).SetUint64(height))
+    if err != nil {
+        return err
+    }
+
+    for _, tx := range block.Transactions() {
+        receipt, err := client.TransactionReceipt(ctx, tx.Hash())
+        if err != nil {
+            return err
+        }
+        if receipt.Status != types.ReceiptStatusSuccessful {
+            continue
+        }
+
+        if tx.To() != nil && tx.Value().Sign() > 0 && myAddresses[*tx.To()] {
+            // ETH 外层原生转账充值：唯一键 chain + tx_hash + native_transfer_index。
+        }
+
+        for _, lg := range receipt.Logs {
+            if !tokenWhitelist[lg.Address] || len(lg.Topics) < 3 || lg.Topics[0] != erc20TransferTopic {
+                continue
+            }
+            to := common.BytesToAddress(lg.Topics[2].Bytes()[12:])
+            if !myAddresses[to] {
+                continue
+            }
+            amount := new(big.Int).SetBytes(lg.Data)
+            if amount.Sign() <= 0 {
+                continue
+            }
+            // ERC20 充值：唯一键 chain + tx_hash + log_index。
+        }
+    }
+    return nil
+}
+
+func filterTransferLogs(ctx context.Context, client *ethclient.Client, fromHeight uint64, toHeight uint64, token common.Address) ([]types.Log, error) {
+    return client.FilterLogs(ctx, ethereum.FilterQuery{
+        FromBlock: new(big.Int).SetUint64(fromHeight),
+        ToBlock:   new(big.Int).SetUint64(toHeight),
+        Addresses: []common.Address{token},
+        Topics:    [][]common.Hash{{erc20TransferTopic}},
+    })
+}
+```
+
+生产扫链不建议逐笔 receipt 串行拉取。可以优先尝试 `BlockReceipts` 或底层 batch RPC，失败时回退到逐笔查询。无论用哪种方式，都必须保存 `block_number/block_hash/parent_hash/tx_index/log_index`，并用 parentHash 做 reorg 检测。
+
+### 11.8 查询 ETH/ERC20 余额和合约代码
+
+```go
+func ethBalance(ctx context.Context, client *ethclient.Client, address common.Address, height *big.Int) (*big.Int, error) {
+    return client.BalanceAt(ctx, address, height)
+}
+
+func erc20Balance(ctx context.Context, client *ethclient.Client, token common.Address, holder common.Address, height *big.Int) (*big.Int, error) {
+    tokenABI, err := abi.JSON(strings.NewReader(erc20ABIJSON))
+    if err != nil {
+        return nil, err
+    }
+    data, err := tokenABI.Pack("balanceOf", holder)
+    if err != nil {
+        return nil, err
+    }
+    out, err := client.CallContract(ctx, ethereum.CallMsg{To: &token, Data: data}, height)
+    if err != nil {
+        return nil, err
+    }
+    values, err := tokenABI.Unpack("balanceOf", out)
+    if err != nil {
+        return nil, err
+    }
+    return values[0].(*big.Int), nil
+}
+```
+
+`client.CodeAt(ctx, address, nil)` 可判断当前地址是否有合约代码，但不能作为提现允许/禁止的唯一依据：合约钱包、多签、代理、EIP-7702 委托账户都会让“EOA/合约”边界变复杂。提现风控应以地址风险、业务策略、链上行为和白名单/黑名单共同判断。
+
+### 11.9 go-ethereum 在生产钱包中的注意点
+
+- 版本锁定：`go-ethereum` 类型和方法会随版本演进，生产应锁定版本，升级前跑交易构建、签名、反解析、logs 解析回归测试。
+- 金额精度：所有金额使用 `*big.Int` 或项目 `internal/bigint`，不要把 wei/token amount 转成 `float64`。
+- 地址比较：使用 `common.Address` 或统一小写字符串比较；展示用 `addr.Hex()` checksum。
+- Nonce：`PendingNonceAt` 只能用于初始化或补偿参考，生产分配必须以本地事务锁为准。
+- 费用：`SuggestGasTipCap` 和 `FeeHistory` 只是报价输入，最终必须经过业务手续费上限、余额上限和 replacement 策略。
+- `EstimateGas`：估算成功不代表上链一定成功；估算失败要区分合约 revert、余额不足、RPC 问题和节点状态问题。
+- Receipt：提现成功必须同时满足 `receipt.Status==1` 和业务输出校验。ERC20 还要校验白名单 token 合约的 `Transfer` event。
+- Logs：按 `tx_hash + log_index` 去重；处理订阅场景中的 `removed=true`；重组时按 block hash 回滚。
+- Raw tx：签后必须用 `UnmarshalBinary` 反解析并用 `types.Sender` 恢复签名地址，不能只信签名服务返回的 hash。
+- Trace/internal transfer：`ethclient` 标准 API 不覆盖 internal ETH 转账。需要 `debug_trace*` 或 `trace_*` 时，用底层 `rpc.Client` 并按 Geth/Erigon/Nethermind/Besu 分别适配。
+
+## 12. 数据模型建议
 
 在项目通用表基础上，EVM 建议新增或扩展：
 
@@ -588,7 +996,7 @@ evm_internal_transfers
 
 余额流水必须可重建余额，不能只依赖余额快照。
 
-## 12. 重组、finality 和回滚
+## 13. 重组、finality 和回滚
 
 Ethereum PoS 主网通常重组深度较小，但交易所钱包不能假设永不重组。工程上仍需保存区块头并按 parentHash 检测。
 
@@ -616,11 +1024,11 @@ Ethereum PoS 主网通常重组深度较小，但交易所钱包不能假设永�
 4. 从共同祖先后重新扫块。
 5. 超过阈值的深度重组触发暂停入账/出账和人工介入。
 
-## 13. 生产案例：ERC20 提现构建与离线签名
+## 14. 生产案例：ERC20 提现构建与离线签名
 
 场景：Ethereum 主网热钱包向外部用户地址提现 100 USDC。假设 USDC decimals=6，金额为 `100000000` 最小单位。示例合约地址和地址仅用于说明，生产必须使用真实白名单配置。
 
-### 13.1 业务请求
+### 14.1 业务请求
 
 ```json
 {
@@ -644,7 +1052,7 @@ Ethereum PoS 主网通常重组深度较小，但交易所钱包不能假设永�
 }
 ```
 
-### 13.2 链上状态输入
+### 14.2 链上状态输入
 
 钱包服务从可信 RPC 和本地库获取：
 
@@ -667,7 +1075,7 @@ Ethereum PoS 主网通常重组深度较小，但交易所钱包不能假设永�
 }
 ```
 
-### 13.3 Unsigned tx
+### 14.3 Unsigned tx
 
 `transfer(address,uint256)` calldata：
 
@@ -695,7 +1103,7 @@ unsigned tx：
 }
 ```
 
-### 13.4 签名前策略校验
+### 14.4 签名前策略校验
 
 钱包服务和签名服务都必须校验：
 
@@ -712,7 +1120,7 @@ unsigned tx：
 - 热钱包 ETH 余额足够支付 fee upper bound，USDC 余额足够支付提现金额。
 - 交易中没有额外未知 data、access list 或 authorization list。
 
-### 13.5 签名服务入参/出参
+### 14.5 签名服务入参/出参
 
 签名服务请求：
 
@@ -779,7 +1187,7 @@ signature = secp256k1_ecdsa(signing_hash)
 }
 ```
 
-### 13.6 签后校验和广播
+### 14.6 签后校验和广播
 
 广播前钱包服务必须：
 
@@ -799,14 +1207,14 @@ signature = secp256k1_ecdsa(signing_hash)
 - 更新提现状态 `OnChainSuccess`，进入安全高度后转 `Finalized`。
 - 若 `status=0`，状态转 `OnChainFailed`，记录 gas 损失，不把用户提现标记成功。
 
-### 13.7 卡单处理
+### 14.7 卡单处理
 
 - 如果交易长时间未上链，先查多节点 `eth_getTransactionByHash`、`eth_getTransactionCount(latest/pending)`、本地 nonce 状态。
 - 需要加速时，构建同 nonce、同输出的新交易，只提高 fee caps。
 - 需要取消时，必须经过业务审批，构建同 nonce 自转 0 ETH 取消交易；原提现单不得自动成功。
 - 如果原交易和替换交易在不同节点返回不一致，暂停该热钱包后续 nonce 广播，直到确认哪笔交易上链。
 
-## 14. 归集设计
+## 15. 归集设计
 
 ETH 归集：
 
@@ -824,7 +1232,7 @@ ERC20 归集：
 - 补 gas 必须有额度、频率和地址归属校验，防止向非系统地址补费。
 - 税费、黑名单、暂停、代理升级 Token 不应使用通用归集策略。
 
-## 15. Token、NFT、Memo/Tag 支持范围
+## 16. Token、NFT、Memo/Tag 支持范围
 
 首期建议：
 
@@ -847,7 +1255,7 @@ Token 风险分类：
 | proxy upgrade | 行为可能变化 | 监控 implementation 变更和合约事件 |
 | non-standard return | `transfer` 不返回 bool 或返回 false | SDK/签后逻辑按 receipt + event 判断，不只看 eth_call |
 
-## 16. 生产安全清单
+## 17. 生产安全清单
 
 密钥与签名：
 
@@ -890,7 +1298,7 @@ Token 风险分类：
 - 节点落后、safe/finalized 停滞、receipt 缺失、重组超阈值告警。
 - 外部浏览器/API 只能辅助，不作为唯一记账源。
 
-## 17. 对当前项目的落地改造建议
+## 18. 对当前项目的落地改造建议
 
 当前 `internal/coinset` 已有 EVM 链基础配置：
 
@@ -932,7 +1340,7 @@ ETH = Chain{
 - 数据模型按 `evm_blocks`、`evm_raw_transactions`、`evm_logs`、`evm_token_transfers`、`evm_nonce_state` 扩展。
 - 文档中必须持续声明 demo 与生产差距，尤其是 RPC 多节点、trace、风控、HSM/MPC、审批、灾备和对账能力。
 
-## 18. 是否建议接入
+## 19. 是否建议接入
 
 建议接入 Ethereum 主网 ETH + 白名单 ERC20。Ethereum/EVM 是交易所钱包必须支持的核心链型，但生产实现复杂度不能低估：Nonce 卡单、费用波动、ERC20 非标准行为、internal transfer、重组和 L2 差异都是高频风险。
 
@@ -960,7 +1368,7 @@ ETH = Chain{
 - 如果支持 internal ETH 充值，必须自建 trace 索引或等价能力。
 - 第三方浏览器/API 不应作为唯一账务来源。
 
-## 19. 参考资料
+## 20. 参考资料
 
 - Ethereum Accounts: <https://ethereum.org/en/developers/docs/accounts/>
 - Ethereum Transactions: <https://ethereum.org/en/developers/docs/transactions/>
