@@ -383,9 +383,841 @@ bitcoin-cli sendrawtransaction '<rawtx_hex>'
 
 RPC 金额字段使用 BTC 小数是 Bitcoin Core 接口格式限制；项目业务库和风控计算仍必须以 satoshi 整数为准，只在 RPC 边界做格式转换。
 
-## 5. 链特性
+## 5. Go SDK：btcsuite 常用 API 和交易所钱包使用方式
 
-### 5.1 链简单原理
+BTC 没有官方 Go SDK。官方参考实现是 Bitcoin Core，生产可信节点能力主要来自 Bitcoin Core JSON-RPC。Go 侧常用的是社区 `btcsuite` 生态，它提供交易结构、脚本、签名、地址、RPC client 等基础库。工程上应表述为“使用 btcsuite 调用 Bitcoin Core RPC 和构建/解析交易”，不要把 `btcd` 或 `btcsuite` 称为 Bitcoin 官方 SDK。
+
+推荐依赖按当前 btcsuite 模块路径选择：
+
+```bash
+go get github.com/btcsuite/btcd/wire
+go get github.com/btcsuite/btcd/chaincfg
+go get github.com/btcsuite/btcd/chaincfg/chainhash
+go get github.com/btcsuite/btcd/txscript
+go get github.com/btcsuite/btcd/btcutil
+go get github.com/btcsuite/btcd/btcjson
+go get github.com/btcsuite/btcd/rpcclient
+go get github.com/btcsuite/btcd/btcec/v2
+go get github.com/btcsuite/btcd/btcutil/hdkeychain
+```
+
+版本建议：
+
+- 生产必须在 `go.mod` 锁定具体版本，不要用浮动 `latest` 直接上线。
+- `txscript`、`wire`、`btcutil` 的 API 随版本演进明显，升级前必须跑交易构建、签名、反解析、脚本验证和 Bitcoin Core `testmempoolaccept` 回归。
+- 当前文档示例按 `btcd v0.25.x` 系列 API 写法说明，实际落地时以本仓库锁定版本的 `go doc` 为准。
+- 本仓库现有 `08-btc-manager/tx-sign-send` 是教学用最小手写实现；若后续做生产级 demo，建议改为 btcsuite 结构化 API，以减少序列化、脚本和签名细节出错概率。
+
+### 5.1 常用包职责
+
+| 包 | 常用类型/方法 | 钱包用途 |
+|----|---------------|----------|
+| `chaincfg` | `MainNetParams`、`TestNet3Params`、`RegressionNetParams`、`SigNetParams` | 地址网络参数、HRP、版本字节，避免主网/测试网地址混用 |
+| `chainhash` | `NewHashFromStr`、`Hash.String()` | txid/block hash 字符串和内部 32 字节 hash 转换 |
+| `wire` | `MsgTx`、`TxIn`、`TxOut`、`OutPoint`、`MsgBlock`、`Serialize`、`Deserialize`、`TxHash`、`WitnessHash`、`SerializeSize`、`SerializeSizeStripped` | 构建交易、解析 rawtx/raw block、计算 txid/wtxid/vsize |
+| `btcutil` | `DecodeAddress`、`NewAddressWitnessPubKeyHash`、`Amount`、`NewTx`、`NewBlock` | 地址编码/解码、金额边界转换、交易/区块便捷封装 |
+| `txscript` | `PayToAddrScript`、`NewTxSigHashes`、`NewMultiPrevOutFetcher`、`RawTxInWitnessSignature`、`NewEngine`、`StandardVerifyFlags` | scriptPubKey 生成、P2WPKH 签名、脚本验签、Taproot 扩展 |
+| `btcec/v2` | `PrivKeyFromBytes`、`PrivateKey.PubKey`、`PublicKey.SerializeCompressed` | secp256k1 私钥/公钥。生产私钥只在签名域使用 |
+| `btcec/v2/ecdsa` | `Sign`、`ParseDERSignature`、`Signature.Serialize` | 离线签名服务内部签 ECDSA，验证 DER 签名 |
+| `btcutil/hdkeychain` | `NewMaster`、`ExtendedKey.Derive`、`ECPrivKey`、`ECPubKey`、`Neuter` | BIP32 派生。生产建议结合 BIP39 seed 管理和 HSM/MPC |
+| `rpcclient` | `New`、`GetBlockCount`、`GetBlockHash`、`GetBlockVerboseTx`、`GetRawTransactionVerbose`、`SendRawTransaction`、`EstimateSmartFee`、`TestMempoolAccept` | 调 Bitcoin Core/btcd JSON-RPC |
+| `btcjson` | `EstimateSmartFeeMode`、RPC result 结构、`RawRequest` 参数结构 | RPC 模式、结果结构和少量未封装 RPC 的参数 |
+
+生产建议把这些能力拆层：
+
+```text
+btc/rpc        Bitcoin Core RPC client、超时、重试、多节点比对
+btc/codec      raw block/raw tx 解析、txid/wtxid/vsize 计算
+btc/address    地址校验、scriptPubKey 构造、网络隔离
+btc/txbuilder  选币后的 unsigned tx 构建、找零、手续费估算
+btc/signer     签名服务适配、sighash 重算、witness 组装
+btc/verifier   签后反解析、脚本验证、testmempoolaccept 预检查
+btc/scanner    扫块、命中地址、UTXO 状态机、重组回滚
+```
+
+### 5.2 地址校验和 scriptPubKey 生成
+
+核心 API：
+
+- `btcutil.DecodeAddress(address, &chaincfg.MainNetParams)`：解析地址。
+- `addr.IsForNet(&chaincfg.MainNetParams)`：校验地址网络。
+- `txscript.PayToAddrScript(addr)`：生成 output 的 `scriptPubKey`。
+- `btcutil.NewAddressWitnessPubKeyHash(pubKeyHash, params)`：由 20 字节 HASH160 生成 P2WPKH 地址。
+
+示例：
+
+```go
+package btc
+
+import (
+    "fmt"
+
+    "github.com/btcsuite/btcd/btcutil"
+    "github.com/btcsuite/btcd/chaincfg"
+    "github.com/btcsuite/btcd/txscript"
+)
+
+func ScriptForAddress(addrText string, params *chaincfg.Params) ([]byte, error) {
+    addr, err := btcutil.DecodeAddress(addrText, params)
+    if err != nil {
+        return nil, fmt.Errorf("decode btc address: %w", err)
+    }
+    if !addr.IsForNet(params) {
+        return nil, fmt.Errorf("address %s is not for network %s", addrText, params.Name)
+    }
+    return txscript.PayToAddrScript(addr)
+}
+```
+
+交易所钱包地址校验规则：
+
+- 主网只接受 `chaincfg.MainNetParams`，测试网/signet/regtest 必须使用独立链命名空间。
+- 用户提现地址可以是 P2PKH/P2SH/P2WPKH/P2TR，但首期系统自有地址建议只派生 P2WPKH，降低签名复杂度。
+- 入库保存 `address`、`script_pubkey`、`script_type`、`derivation_path`、`address_kind`。扫块时以 `scriptPubKey` 或规范地址命中本地地址表。
+- 不要只用字符串前缀判断地址类型。`bc1q`/`bc1p`/`1`/`3` 是展示特征，最终应由解码后的地址类型和 `scriptPubKey` 决定。
+
+### 5.3 BIP32 派生 P2WPKH 地址
+
+核心 API：
+
+- `hdkeychain.NewMaster(seed, params)`：生成 master extended key。
+- `key.Derive(hdkeychain.HardenedKeyStart + index)`：派生 hardened child。
+- `key.Derive(index)`：派生 non-hardened child。
+- `key.ECPrivKey()` / `key.ECPubKey()`：取 secp256k1 私钥/公钥。
+- `pub.SerializeCompressed()`：压缩公钥。
+- `btcutil.Hash160(compressedPubKey)`：HASH160。
+- `btcutil.NewAddressWitnessPubKeyHash(pubKeyHash, params)`：P2WPKH 地址。
+
+示例派生 `m/84'/0'/0'/0/0`：
+
+```go
+package btc
+
+import (
+    "github.com/btcsuite/btcd/btcutil"
+    "github.com/btcsuite/btcd/chaincfg"
+    "github.com/btcsuite/btcd/btcutil/hdkeychain"
+)
+
+func DeriveP2WPKH(seed []byte, params *chaincfg.Params) (string, []byte, error) {
+    key, err := hdkeychain.NewMaster(seed, params)
+    if err != nil {
+        return "", nil, err
+    }
+
+    path := []uint32{
+        hdkeychain.HardenedKeyStart + 84,
+        hdkeychain.HardenedKeyStart + 0,
+        hdkeychain.HardenedKeyStart + 0,
+        0,
+        0,
+    }
+    for _, child := range path {
+        key, err = key.Derive(child)
+        if err != nil {
+            return "", nil, err
+        }
+    }
+
+    pub, err := key.ECPubKey()
+    if err != nil {
+        return "", nil, err
+    }
+    compressed := pub.SerializeCompressed()
+    addr, err := btcutil.NewAddressWitnessPubKeyHash(btcutil.Hash160(compressed), params)
+    if err != nil {
+        return "", nil, err
+    }
+    return addr.EncodeAddress(), compressed, nil
+}
+```
+
+生产注意点：
+
+- `seed`、master xprv、账户 xprv 不应出现在在线钱包服务。在线服务最多持有 xpub 或地址派生结果。
+- 如果签名服务接收 `derivation_path`，必须校验 path 属于该 key id 允许范围，例如只允许 `m/84'/0'/0'/0/*` 和 `m/84'/0'/0'/1/*`。
+- 找零地址必须由系统生成并登记，不能由提现请求传入。
+- BIP39 mnemonic 到 seed 的过程不在 `btcsuite` 核心包中，可用独立库或现有 keyman；生产应由 HSM/MPC/离线密钥系统管理。
+
+### 5.4 构建 P2WPKH 提现交易
+
+核心 API：
+
+- `wire.NewMsgTx(version)`：创建交易。
+- `chainhash.NewHashFromStr(prevTxID)`：解析 txid 字符串。
+- `wire.NewOutPoint(prevHash, prevVout)`：构造 prevout。
+- `wire.NewTxIn(outPoint, nil, nil)`：构造输入。
+- `wire.NewTxOut(amountSat, pkScript)`：构造输出。
+- `tx.AddTxIn(txIn)`、`tx.AddTxOut(txOut)`：添加输入/输出。
+- `tx.Serialize(&buf)`：序列化 rawtx。
+- `tx.TxHash()`：交易 txid，不含 witness。
+- `tx.WitnessHash()`：wtxid，包含 witness。
+
+示例：选币已经完成，构建 1 笔用户输出 + 可选找零输出：
+
+```go
+package btc
+
+import (
+    "bytes"
+    "encoding/hex"
+    "fmt"
+
+    "github.com/btcsuite/btcd/chaincfg"
+    "github.com/btcsuite/btcd/chaincfg/chainhash"
+    "github.com/btcsuite/btcd/txscript"
+    "github.com/btcsuite/btcd/wire"
+)
+
+const (
+    finalSequence uint32 = 0xffffffff
+    rbfSequence   uint32 = 0xfffffffd
+    dustP2WPKHSat int64  = 546
+)
+
+type SpendUTXO struct {
+    PrevTxID     string
+    PrevVout     uint32
+    AmountSat    int64
+    ScriptPubKey []byte
+}
+
+func BuildP2WPKHTx(inputs []SpendUTXO, toAddr string, withdrawSat int64, changeAddr string, feeRateSatVB int64, params *chaincfg.Params, enableRBF bool) (*wire.MsgTx, int64, error) {
+    if len(inputs) == 0 {
+        return nil, 0, fmt.Errorf("empty inputs")
+    }
+    if withdrawSat <= 0 || feeRateSatVB <= 0 {
+        return nil, 0, fmt.Errorf("invalid amount or fee rate")
+    }
+
+    inputSum := int64(0)
+    tx := wire.NewMsgTx(2)
+    seq := finalSequence
+    if enableRBF {
+        seq = rbfSequence
+    }
+
+    for _, in := range inputs {
+        h, err := chainhash.NewHashFromStr(in.PrevTxID)
+        if err != nil {
+            return nil, 0, err
+        }
+        outPoint := wire.NewOutPoint(h, in.PrevVout)
+        txIn := wire.NewTxIn(outPoint, nil, nil)
+        txIn.Sequence = seq
+        tx.AddTxIn(txIn)
+        inputSum += in.AmountSat
+    }
+
+    toScript, err := ScriptForAddress(toAddr, params)
+    if err != nil {
+        return nil, 0, err
+    }
+    tx.AddTxOut(wire.NewTxOut(withdrawSat, toScript))
+
+    estimatedVSize := int64(10 + 68*len(inputs) + 31*2)
+    feeSat := estimatedVSize * feeRateSatVB
+    changeSat := inputSum - withdrawSat - feeSat
+    if changeSat < 0 {
+        return nil, 0, fmt.Errorf("insufficient input: input=%d withdraw=%d fee=%d", inputSum, withdrawSat, feeSat)
+    }
+    if changeSat >= dustP2WPKHSat {
+        changeScript, err := ScriptForAddress(changeAddr, params)
+        if err != nil {
+            return nil, 0, err
+        }
+        tx.AddTxOut(wire.NewTxOut(changeSat, changeScript))
+    } else {
+        feeSat += changeSat
+        changeSat = 0
+    }
+
+    // unsigned rawtx 仅用于审计/签名请求，不能广播。
+    var buf bytes.Buffer
+    if err := tx.Serialize(&buf); err != nil {
+        return nil, 0, err
+    }
+    _ = hex.EncodeToString(buf.Bytes())
+    _ = txscript.StandardVerifyFlags
+
+    return tx, feeSat, nil
+}
+```
+
+生产构建时不要让业务方直接传 `inputs`、`changeAddr`、`scriptPubKey`。这些数据必须来自本地 UTXO 表和地址表，并在数据库事务里完成：
+
+```text
+Available UTXO
+  -> SELECT ... FOR UPDATE
+  -> Reserved
+  -> 构建 unsigned tx
+  -> 签名前策略校验
+  -> Signed
+  -> PendingSpend
+```
+
+签名前校验至少包括：
+
+- `sum(inputs) == sum(outputs) + fee`。
+- 每个 input 都来自本系统 `Available/Reserved` UTXO，且 `amount/script_pubkey/address_kind` 与本地索引一致。
+- 目标输出地址和金额等于提现单。
+- 找零输出地址属于系统 change path。
+- 找零低于 dust 时不得生成 dust UTXO。
+- `fee_rate_sat_vB`、`fee_sat`、`fee/withdraw_amount` 不超过风控上限。
+- 如果启用 RBF，所有 input sequence 满足替换策略；如果不启用，使用 final sequence。
+
+### 5.5 P2WPKH 签名和 witness 组装
+
+核心 API：
+
+- `txscript.NewMultiPrevOutFetcher(nil)`：多 input prevout fetcher。
+- `prevFetcher.AddPrevOut(outPoint, wire.NewTxOut(amount, scriptPubKey))`：加入被花费输出。
+- `txscript.NewTxSigHashes(tx, prevFetcher)`：预计算 BIP143/Taproot sighash 中间态。
+- `txscript.RawTxInWitnessSignature(tx, sigHashes, idx, amount, scriptCode, txscript.SigHashAll, privKey)`：生成 P2WPKH ECDSA 签名，返回值已追加 sighash byte。
+- `tx.TxIn[idx].Witness = wire.TxWitness{sig, compressedPubKey}`：组装 witness。
+
+P2WPKH 的 `scriptCode` 不是原始 `0014{20-byte-hash}`，而是等价 P2PKH script：
+
+```text
+scriptPubKey = 0014{20-byte-pubkey-hash}
+scriptCode   = 76a914{20-byte-pubkey-hash}88ac
+```
+
+示例：
+
+```go
+package btc
+
+import (
+    "bytes"
+    "fmt"
+
+    "github.com/btcsuite/btcd/btcec/v2"
+    "github.com/btcsuite/btcd/txscript"
+    "github.com/btcsuite/btcd/wire"
+)
+
+func P2WPKHScriptCode(scriptPubKey []byte) ([]byte, error) {
+    if len(scriptPubKey) != 22 || scriptPubKey[0] != 0x00 || scriptPubKey[1] != 0x14 {
+        return nil, fmt.Errorf("not p2wpkh scriptPubKey: %x", scriptPubKey)
+    }
+    pubKeyHash := scriptPubKey[2:]
+    return append(append([]byte{0x76, 0xa9, 0x14}, pubKeyHash...), 0x88, 0xac), nil
+}
+
+func SignP2WPKHInputs(tx *wire.MsgTx, inputs []SpendUTXO, privKeys []*btcec.PrivateKey) error {
+    if len(inputs) != len(tx.TxIn) || len(inputs) != len(privKeys) {
+        return fmt.Errorf("input/key count mismatch")
+    }
+
+    prevFetcher := txscript.NewMultiPrevOutFetcher(nil)
+    for i, in := range inputs {
+        prevFetcher.AddPrevOut(tx.TxIn[i].PreviousOutPoint, wire.NewTxOut(in.AmountSat, in.ScriptPubKey))
+    }
+    sigHashes := txscript.NewTxSigHashes(tx, prevFetcher)
+
+    for i, in := range inputs {
+        scriptCode, err := P2WPKHScriptCode(in.ScriptPubKey)
+        if err != nil {
+            return err
+        }
+        sig, err := txscript.RawTxInWitnessSignature(
+            tx,
+            sigHashes,
+            i,
+            in.AmountSat,
+            scriptCode,
+            txscript.SigHashAll,
+            privKeys[i],
+        )
+        if err != nil {
+            return err
+        }
+        pub := privKeys[i].PubKey().SerializeCompressed()
+        tx.TxIn[i].SignatureScript = nil
+        tx.TxIn[i].Witness = wire.TxWitness{sig, pub}
+    }
+    return nil
+}
+
+func RawTxHex(tx *wire.MsgTx) (string, error) {
+    var buf bytes.Buffer
+    if err := tx.Serialize(&buf); err != nil {
+        return "", err
+    }
+    return fmt.Sprintf("%x", buf.Bytes()), nil
+}
+```
+
+生产签名服务不建议直接接收 `privKeys`。更合理的请求是：
+
+```json
+{
+  "request_id": "btc-sign-900001",
+  "chain": "BTC",
+  "network": "mainnet",
+  "tx_version": 2,
+  "lock_time": 0,
+  "sighash_type": "ALL",
+  "inputs": [
+    {
+      "index": 0,
+      "prev_txid": "...",
+      "prev_vout": 0,
+      "amount_sat": "1500000",
+      "script_pubkey": "0014...",
+      "script_code": "76a914...88ac",
+      "derivation_path": "m/84'/0'/0'/1/25",
+      "expected_pubkey": "02..."
+    }
+  ],
+  "outputs": [
+    {"index": 0, "address": "bc1q...", "amount_sat": "1000000", "purpose": "withdraw_target"},
+    {"index": 1, "address": "bc1q...", "amount_sat": "497200", "purpose": "system_change"}
+  ],
+  "policy": {
+    "max_fee_sat": "20000",
+    "max_fee_rate_sat_vb": "100",
+    "require_change_owned_by_system": true
+  }
+}
+```
+
+签名域必须重算：
+
+- outpoint、amount、scriptCode、outputs、sequence、locktime 共同参与 BIP143 sighash。
+- `script_pubkey -> pubKeyHash -> scriptCode` 必须自洽。
+- `expected_pubkey` 必须等于 key id + derivation path 派生出的压缩公钥。
+- 不能只接受在线服务传来的 32 字节摘要并盲签。
+
+### 5.6 签后脚本验证和 rawtx 反解析
+
+核心 API：
+
+- `txscript.NewEngine(scriptPubKey, tx, idx, flags, sigCache, sigHashes, amount, prevFetcher)`：创建脚本执行引擎。
+- `engine.Execute()`：执行脚本验证。
+- `wire.MsgTx.Deserialize(reader)`：反序列化 rawtx。
+- `tx.TxHash()` / `tx.WitnessHash()`：计算 txid/wtxid。
+- `tx.SerializeSize()` / `tx.SerializeSizeStripped()`：计算 total/base size。
+
+示例：
+
+```go
+package btc
+
+import (
+    "bytes"
+    "encoding/hex"
+    "fmt"
+
+    "github.com/btcsuite/btcd/txscript"
+    "github.com/btcsuite/btcd/wire"
+)
+
+func VerifySignedP2WPKH(rawTxHex string, inputs []SpendUTXO) (*wire.MsgTx, int, error) {
+    raw, err := hex.DecodeString(rawTxHex)
+    if err != nil {
+        return nil, 0, err
+    }
+    tx := wire.NewMsgTx(2)
+    if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+        return nil, 0, err
+    }
+    if len(tx.TxIn) != len(inputs) {
+        return nil, 0, fmt.Errorf("input count mismatch")
+    }
+
+    prevFetcher := txscript.NewMultiPrevOutFetcher(nil)
+    for i, in := range inputs {
+        prevFetcher.AddPrevOut(tx.TxIn[i].PreviousOutPoint, wire.NewTxOut(in.AmountSat, in.ScriptPubKey))
+    }
+    sigHashes := txscript.NewTxSigHashes(tx, prevFetcher)
+
+    for i, in := range inputs {
+        engine, err := txscript.NewEngine(
+            in.ScriptPubKey,
+            tx,
+            i,
+            txscript.StandardVerifyFlags,
+            nil,
+            sigHashes,
+            in.AmountSat,
+            prevFetcher,
+        )
+        if err != nil {
+            return nil, 0, err
+        }
+        if err := engine.Execute(); err != nil {
+            return nil, 0, fmt.Errorf("script verify input %d: %w", i, err)
+        }
+    }
+
+    weight := tx.SerializeSizeStripped()*3 + tx.SerializeSize()
+    vsize := (weight + 3) / 4
+    return tx, vsize, nil
+}
+```
+
+广播前反解析必须做业务校验，而不只是脚本验签：
+
+- input outpoint 全部等于已锁定 UTXO。
+- 每个 input 的 `amount/script_pubkey` 来自本地 UTXO 表。
+- output 集合中提现目标地址和金额等于业务单。
+- 找零地址属于本系统，且 address kind 是 `Change`。
+- `actual_fee_sat = input_sum - output_sum`。
+- `actual_fee_rate_sat_vB = actual_fee_sat / actual_vsize_vB`。
+- `actual_fee_sat`、`actual_fee_rate_sat_vB`、`max_fee_ratio` 都在风控范围内。
+- `txid`、`wtxid`、rawtx、vsize、input/output 明细全部落库后再广播。
+
+### 5.7 解析 raw transaction 和 raw block
+
+核心 API：
+
+- `tx.Deserialize(bytes.NewReader(rawTx))`：解析 raw tx。
+- `block.Deserialize(bytes.NewReader(rawBlock))`：解析 raw block。
+- `tx.TxHash().String()`：txid。
+- `tx.WitnessHash().String()`：wtxid。
+- 遍历 `tx.TxIn`：花费的 previous outpoint。
+- 遍历 `tx.TxOut`：输出金额和 `PkScript`。
+- `txscript.ExtractPkScriptAddrs(pkScript, params)`：解析标准脚本地址和类型。
+
+示例：解析 raw tx 并识别本系统地址输出/输入：
+
+```go
+package btc
+
+import (
+    "bytes"
+    "encoding/hex"
+    "fmt"
+
+    "github.com/btcsuite/btcd/chaincfg"
+    "github.com/btcsuite/btcd/txscript"
+    "github.com/btcsuite/btcd/wire"
+)
+
+type ParsedOutput struct {
+    Index        uint32
+    AmountSat    int64
+    ScriptHex    string
+    ScriptClass  string
+    Address      string
+    IsOurs       bool
+}
+
+func ParseRawTxForWallet(rawTxHex string, params *chaincfg.Params, ourAddresses map[string]bool, ourOutpoints map[string]bool) error {
+    raw, err := hex.DecodeString(rawTxHex)
+    if err != nil {
+        return err
+    }
+    tx := wire.NewMsgTx(2)
+    if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+        return err
+    }
+
+    txid := tx.TxHash().String()
+    for i, in := range tx.TxIn {
+        if len(tx.TxIn) == 1 && in.PreviousOutPoint.Hash.String() == "0000000000000000000000000000000000000000000000000000000000000000" && in.PreviousOutPoint.Index == 0xffffffff {
+            continue
+        }
+        prevKey := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
+        if ourOutpoints[prevKey] {
+            // 本系统 UTXO 被花费：更新 wallet_utxos.status = PendingSpend/Spent。
+            _ = i
+        }
+    }
+
+    for n, out := range tx.TxOut {
+        class, addrs, _, err := txscript.ExtractPkScriptAddrs(out.PkScript, params)
+        if err != nil {
+            continue
+        }
+        for _, addr := range addrs {
+            addrText := addr.EncodeAddress()
+            if ourAddresses[addrText] {
+                // 命中充值/找零/热钱包地址：插入 wallet_btc_tx_outputs 和 wallet_utxos。
+                _ = ParsedOutput{
+                    Index:       uint32(n),
+                    AmountSat:   out.Value,
+                    ScriptHex:   hex.EncodeToString(out.PkScript),
+                    ScriptClass: class.String(),
+                    Address:     addrText,
+                    IsOurs:      true,
+                }
+            }
+        }
+    }
+    _ = txid
+    return nil
+}
+```
+
+示例：解析 Bitcoin Core `getblock(hash, 0)` 返回的 raw block：
+
+```go
+func ParseRawBlock(rawBlockHex string, params *chaincfg.Params) error {
+    raw, err := hex.DecodeString(rawBlockHex)
+    if err != nil {
+        return err
+    }
+    block := wire.NewMsgBlock(&wire.BlockHeader{})
+    if err := block.Deserialize(bytes.NewReader(raw)); err != nil {
+        return err
+    }
+
+    blockHash := block.BlockHash().String()
+    prevHash := block.Header.PrevBlock.String()
+    height := int64(0) // 高度来自 getblock/header RPC 或本地扫描任务，不在 raw block 内。
+
+    for txIndex, tx := range block.Transactions {
+        txid := tx.TxHash().String()
+        _ = txid
+        _ = txIndex
+        // 遍历 tx.TxIn / tx.TxOut，命中系统地址和 UTXO。
+    }
+    _ = blockHash
+    _ = prevHash
+    _ = height
+    return nil
+}
+```
+
+生产扫链建议：
+
+- raw block 二进制解析比 `getblock(hash, 2)` JSON 更接近链上真实结构；JSON 适合调试和运营查询。
+- 扫块主流程保存 block header：`height/hash/prev_hash/time/tx_count`。
+- 先处理 `vin` 花费本地 UTXO，再处理 `vout` 产生新系统 UTXO；同一交易可能同时有系统输入和系统输出。
+- coinbase 输入不引用普通 prevout，不应按外部花费处理。
+- `OP_RETURN`、非标准脚本、Ordinals/Runes 相关输出不要进入普通 BTC 余额。
+- `txid + vout` 是 UTXO 唯一键；`txid + vin_index` 是输入审计唯一键。
+
+### 5.8 使用 rpcclient 调 Bitcoin Core
+
+核心 API：
+
+- `rpcclient.New(connCfg, nil)`：创建 RPC client。
+- `client.GetBlockCount()`：最新高度。
+- `client.GetBlockHash(height)`：高度转 block hash。
+- `client.GetBlockVerboseTx(hash)`：获取区块和交易 JSON。
+- `client.GetBlock(hash)`：获取区块结构，适合 btcd；与 Bitcoin Core 兼容性需按版本实测。
+- `client.GetRawTransactionVerbose(txHash)`：查询交易详情。
+- `client.SendRawTransaction(tx, allowHighFees)`：广播交易。
+- `client.EstimateSmartFee(confTarget, &mode)`：估算费率。
+- `client.TestMempoolAccept([]*wire.MsgTx{tx}, maxFeeRate)`：mempool 预检查。
+- `client.RawRequest(method, params)`：调用未封装或参数差异较大的 RPC。
+
+连接 Bitcoin Core：
+
+```go
+package btc
+
+import (
+    "github.com/btcsuite/btcd/rpcclient"
+)
+
+func NewBitcoinCoreRPC(host, user, pass string) (*rpcclient.Client, error) {
+    return rpcclient.New(&rpcclient.ConnConfig{
+        Host:         host, // "127.0.0.1:8332"
+        User:         user,
+        Pass:         pass,
+        HTTPPostMode: true, // Bitcoin Core 使用 HTTP POST
+        DisableTLS:   true, // Bitcoin Core RPC 默认无 TLS，生产靠内网、鉴权和网关保护
+    }, nil)
+}
+```
+
+获取区块并扫链：
+
+```go
+func ScanHeight(client *rpcclient.Client, height int64) error {
+    hash, err := client.GetBlockHash(height)
+    if err != nil {
+        return err
+    }
+    block, err := client.GetBlockVerboseTx(hash)
+    if err != nil {
+        return err
+    }
+
+    // block.Hash、block.PreviousHash、block.Time 用于 parentHash 检测。
+    for txIndex, tx := range block.Tx {
+        _ = tx.Txid
+        _ = txIndex
+        // JSON 中 vout.scriptPubKey.address/type/hex 可用于快速调试。
+        // 生产建议保存 rawtx 或同步二进制解析结果，避免只依赖 JSON 字段格式。
+    }
+    return nil
+}
+```
+
+费率估算：
+
+```go
+func EstimateFeeRateSatVB(client *rpcclient.Client, targetBlocks int64) (int64, error) {
+    mode := btcjson.EstimateModeConservative
+    res, err := client.EstimateSmartFee(targetBlocks, &mode)
+    if err != nil {
+        return 0, err
+    }
+    if res.FeeRate == nil || *res.FeeRate <= 0 {
+        return 0, fmt.Errorf("estimatesmartfee unavailable: %+v", res.Errors)
+    }
+
+    // Bitcoin Core 返回 BTC/kvB；换算为 sat/vB:
+    // 1 BTC = 100_000_000 sat, 1 kvB = 1000 vB。
+    satVB := int64((*res.FeeRate * 100_000_000 / 1000) + 0.999)
+    return satVB, nil
+}
+```
+
+广播前预检查和广播：
+
+```go
+func CheckAndBroadcast(client *rpcclient.Client, tx *wire.MsgTx) (string, error) {
+    // 生产必须先落库 rawtx，再做 testmempoolaccept。
+    // maxFeeRate 是 BTC/kvB 的上限保护，具体类型以锁定版本 btcjson 为准。
+    results, err := client.TestMempoolAccept([]*wire.MsgTx{tx}, btcjson.BTCPerkvB(0.10))
+    if err != nil {
+        return "", err
+    }
+    if len(results) != 1 || !results[0].Allowed {
+        return "", fmt.Errorf("mempool reject: %+v", results)
+    }
+
+    txHash, err := client.SendRawTransaction(tx, false)
+    if err != nil {
+        return "", err
+    }
+    return txHash.String(), nil
+}
+```
+
+如果锁定版本的 `rpcclient` 对某个 Bitcoin Core RPC 支持不足，可以使用 `RawRequest`：
+
+```go
+func RawTestMempoolAccept(client *rpcclient.Client, rawTxHex string) error {
+    params := []json.RawMessage{
+        json.RawMessage(fmt.Sprintf(`["%s"]`, rawTxHex)),
+    }
+    resp, err := client.RawRequest("testmempoolaccept", params)
+    if err != nil {
+        return err
+    }
+    _ = resp
+    return nil
+}
+```
+
+生产 RPC 注意点：
+
+- `rpcclient` 可以连 Bitcoin Core，但不同 Bitcoin Core 版本的 RPC 字段可能变化，必须做兼容测试。
+- `GetBlockVerboseTx` 方便但重，扫块高峰期建议用 raw block + 自建解析器或批量 RPC。
+- `GetRawTransactionVerbose` 查询历史交易通常要求 `txindex=1` 或提供 block hash。
+- `sendrawtransaction` 返回成功只代表节点接受/广播，不代表上链成功。
+- `testmempoolaccept` 是广播前预检查，不等于最终确认；它还依赖当前节点 mempool 和 UTXO 视图。
+- 多节点返回高度、block hash、mempool 结果不一致时，应暂停对应链出金或切换只读模式。
+
+### 5.9 用 SDK 实现交易所扫链状态流转
+
+推荐扫块伪代码：
+
+```go
+func ScanNextBlock(ctx context.Context, rpc *rpcclient.Client, height int64) error {
+    hash, err := rpc.GetBlockHash(height)
+    if err != nil {
+        return err
+    }
+
+    block, err := rpc.GetBlockVerboseTx(hash)
+    if err != nil {
+        return err
+    }
+
+    // 1. parentHash 校验。
+    // localTip.Hash 必须等于 block.PreviousHash，否则进入 reorg 回滚。
+
+    // 2. 开启 DB 事务，插入 wallet_btc_blocks。
+    // 3. 遍历交易，插入 wallet_btc_txs。
+    for txIndex, tx := range block.Tx {
+        // 4. vin 命中本地 UTXO: wallet_utxos.status -> Spent/PendingSpend。
+        for vinIndex, vin := range tx.Vin {
+            if vin.Txid == "" {
+                continue // coinbase
+            }
+            _ = vinIndex
+            // SELECT * FROM wallet_utxos WHERE txid=vin.Txid AND tx_out_index=vin.Vout
+        }
+
+        // 5. vout 命中系统地址: 插入 wallet_btc_tx_outputs + wallet_utxos。
+        for _, vout := range tx.Vout {
+            _ = vout.N
+            _ = txIndex
+            // 地址和 scriptPubKey hex 命中本地地址表。
+        }
+    }
+
+    // 6. 更新充值确认数、提现上链状态和本地 tip。
+    return nil
+}
+```
+
+更稳妥的做法是扫块时尽量保存二进制解析字段：
+
+```text
+block:
+  height, hash, prev_hash, time, bits, nonce, merkle_root
+
+tx:
+  txid, wtxid, version, lock_time, size, vsize, weight, tx_index
+
+vin:
+  txid, vin_index, prev_txid, prev_tx_out_index, sequence, script_sig, witness, is_ours
+
+vout:
+  txid, tx_out_index, amount_sat, script_pubkey, script_type, address, is_ours
+```
+
+充值入账规则：
+
+- 只认已进块交易，不把 mempool 当入账依据。
+- `vout` 命中用户充值地址，金额大于 dust 和业务最小充值金额。
+- 达到确认数后才 `Credited`。
+- 同一交易多个输出命中不同用户地址时，按 `txid + vout` 分别入账。
+- 重组时按 `block_hash` 回滚充值、UTXO、提现上链状态和余额流水。
+
+提现确认规则：
+
+- 本系统 rawtx 的 `txid` 被扫到进块，状态转 `PendingOnChain`。
+- 所有业务输出仍存在且金额正确。
+- 达到确认数后转 `Success`。
+- 如果本地 UTXO 被非本系统交易花费，必须进入严重告警：可能是私钥泄露、重复签名、数据库状态错误或重组处理错误。
+
+### 5.10 PSBT、btcwallet 和生产边界
+
+btcsuite 生态还有 `btcwallet` 和 PSBT 相关工具，但交易所托管钱包首期不建议把生产私钥导入在线钱包进程：
+
+- Bitcoin Core wallet / btcwallet 适合个人钱包或内部工具，不适合作为交易所账务状态机核心。
+- 交易所应自建地址表、UTXO 表、交易表、提现状态机、归集状态机和对账系统。
+- PSBT 适合冷签、多签、硬件签名协作，可以作为热钱包离线签名协议的候选格式。
+- 如果采用 PSBT，签名服务仍必须解析 inputs、outputs、prevout amount、scriptPubKey、derivation path、找零归属和手续费上限，不能只“签 PSBT”。
+
+### 5.11 SDK 生产安全清单
+
+- 依赖锁定：`btcd`、`btcutil`、`txscript`、`rpcclient` 固定版本，升级前做回归。
+- 金额精度：业务层只用 satoshi 整数，`btcutil.Amount` 和 Bitcoin Core BTC 小数只在边界层转换。
+- 网络隔离：`chaincfg.MainNetParams/TestNet3Params/SigNetParams/RegressionNetParams` 必须和本地 `coinset` 链配置一致。
+- 地址归属：提现目标可以外部传入，找零地址必须系统生成；签名前签后都校验。
+- Prevout 完整性：P2WPKH/Taproot 签名必须带 prevout amount 和 scriptPubKey，缺一不可。
+- 私钥隔离：在线服务不得调用 `ECPrivKey` 或持有热钱包私钥；demo 例外但文档必须标注。
+- 签后反解析：广播前用 `wire.Deserialize`、`txscript.NewEngine`、真实 vsize 和手续费复算校验。
+- 节点预检查：`testmempoolaccept` 通过后再广播；失败原因归类到状态机。
+- 扫链主账源：`rpcclient` 只是节点接口，生产记账源仍是自建扫块索引和数据库状态机。
+- 重组处理：所有表保存 `block_hash`，按共同祖先回滚，不只按高度覆盖。
+- 高风险 UTXO：Ordinals/Runes/稀有聪、dust、可疑来源、冻结地址 UTXO 需要 risk flag，选币时排除。
+
+## 6. 链特性
+
+### 6.1 链简单原理
 
 BTC 区块包含区块头和交易列表。区块头中 `previousblockhash` 指向父块，钱包同步器可沿用本项目 `parentHash` 检测思路：
 
@@ -394,7 +1226,7 @@ BTC 区块包含区块头和交易列表。区块头中 `previousblockhash` 指�
 - 不一致说明发生重组，向前查找共同祖先。
 - 回滚被替换区块中的充值、提现、系统交易和 UTXO 状态。
 
-### 5.2 共识和确认数
+### 6.2 共识和确认数
 
 BTC 是 PoW，不支持 PoS/DPoS 质押。交易所一般至少使用 3 到 6 个确认，金额越大确认数越高。建议本项目初始配置：
 
@@ -403,7 +1235,7 @@ BTC 是 PoW，不支持 PoS/DPoS 质押。交易所一般至少使用 3 到 6 �
 - 大额充值：12 确认或人工复核。
 - 提现成功状态：交易进块后先标记 `PendingOnChain`，达到确认数后标记 `Success`。
 
-### 5.3 账户模型和 UTXO
+### 6.3 账户模型和 UTXO
 
 BTC 没有链上账户余额。地址余额是钱包索引器根据未花费输出聚合出来的结果。
 
@@ -414,15 +1246,15 @@ BTC 没有链上账户余额。地址余额是钱包索引器根据未花费输�
 - 交易可能产生找零 output，找零必须回到系统控制地址。
 - 同一笔 BTC 交易可以同时包含多个输入和多个输出，甚至同时命中多个用户地址。
 
-### 5.4 Token、NFT 和同源链
+### 6.4 Token、NFT 和同源链
 
 BTC 主链没有 EVM 式合约 Token。Ordinals、BRC-20、Runes 等协议不是 Bitcoin Core 原生资产余额模型，需要额外索引器，且对交易构建有更高风控要求，避免误花带铭文/稀有聪的 UTXO。
 
 同源/类似 UTXO 链包括 LTC、BCH、DOGE、DASH、ZEC 等，但地址编码、签名哈希、费用市场和 RPC 细节各不相同，不能简单复用 BTC 参数。
 
-## 6. RPC 调研
+## 7. RPC 调研
 
-### 6.1 推荐节点接口
+### 7.1 推荐节点接口
 
 基础可用方案：Bitcoin Core 全节点 + JSON-RPC。
 
@@ -442,7 +1274,7 @@ BTC 主链没有 EVM 式合约 Token。Ordinals、BRC-20、Runes 等协议不是
 | Mempool 条目 | `getmempoolentry` | 查询未确认交易费率、祖先/后代信息 |
 | 扫描 UTXO 集 | `scantxoutset` | 可按 descriptor 扫描链上 UTXO，适合初始化/对账，不适合高频业务 |
 
-### 6.2 余额和地址交易记录
+### 7.2 余额和地址交易记录
 
 Bitcoin Core 不支持类似 `eth_getBalance(address)` 的任意地址余额查询，也不提供普通地址维度交易列表。可选方案：
 
@@ -450,7 +1282,7 @@ Bitcoin Core 不支持类似 `eth_getBalance(address)` 的任意地址余额查�
 2. Bitcoin Core wallet：可导入 descriptor/watch-only 地址，但对交易所多用户地址、历史索引和业务状态机不够透明。
 3. Electrum Server / Esplora / Blockbook：可作为数据平台或二次校验服务，但生产记账仍应以自建索引和自有节点为主。
 
-### 6.3 区块解析策略
+### 7.3 区块解析策略
 
 建议用 `getblock(hash, 2)` 拉完整交易数据：
 
@@ -458,9 +1290,9 @@ Bitcoin Core 不支持类似 `eth_getBalance(address)` 的任意地址余额查�
 - 遍历每笔交易的 `vin`，根据 `txid + vout` 查本地 UTXO，命中则标记为已花费，并记录 `spend_txid`、`spend_height`。
 - coinbase 交易没有普通 `vin.txid/vout`，只解析其输出即可；交易所一般不会接收 coinbase 作为用户直接充值，若接收需考虑 coinbase maturity。
 
-## 7. 节点部署调研
+## 8. 节点部署调研
 
-### 7.1 Bitcoin Core 配置建议
+### 8.1 Bitcoin Core 配置建议
 
 生产扫块节点建议：
 
@@ -484,7 +1316,7 @@ dbcache=4096
 - ZMQ 可用于新区块通知，但业务仍应以高度轮询和 parentHash 校验兜底。
 - 至少部署两套独立节点，最好不同机房/不同磁盘，支持二次校验和故障切换。
 
-### 7.2 初始化同步
+### 8.2 初始化同步
 
 初始化流程：
 
@@ -496,7 +1328,7 @@ dbcache=4096
 
 如果项目已有用户历史地址，不能只从当前高度开始扫；必须从最早地址启用高度或迁移快照开始。
 
-## 8. 费用模型
+## 9. 费用模型
 
 BTC 手续费不是按金额比例收取，而是按交易虚拟大小：
 
@@ -524,7 +1356,7 @@ fee   ≈ 140 * 20 = 2800 sat
 - 高峰期提现可按 SLA 分档：慢速/普通/快速。
 - 生产不能固定写死 `20 sat/vB`。应结合 Bitcoin Core `estimatesmartfee`、自建 mempool 统计或可靠费率源，按目标确认块数动态给出慢速/普通/快速费率，并设置最低费率、最高费率和人工兜底策略。
 
-### 8.1 生产手续费计算方案
+### 9.1 生产手续费计算方案
 
 生产中的 BTC 手续费计算建议拆成两层：
 
@@ -589,7 +1421,7 @@ selected_fee_rate =
 | P2WPKH output | 约 31 vB | Native SegWit 输出 |
 | P2TR output | 约 43 vB | Taproot 输出 |
 
-### 8.2 签名前估算与签后真实 vsize 校验
+### 9.2 签名前估算与签后真实 vsize 校验
 
 生产中建议明确区分两个字段：
 
@@ -708,7 +1540,7 @@ sla_fee_policy
 
 最终落库字段建议记录：`fee_rate_source`、`fee_rate_level`、`selected_fee_rate_sat_vB`、`estimated_vsize_vb`、`actual_vsize_vb`、`estimated_fee_sat`、`actual_fee_sat`、`actual_fee_rate_sat_vb`、`max_fee_sat`、`fee_policy_snapshot`。这样后续 RBF、手续费复盘、用户争议和财务对账都有依据。
 
-### 8.3 RBF 加速
+### 9.3 RBF 加速
 
 RBF 是 Replace-By-Fee，即用“花费同一批 input、支付更高手续费”的新交易替换未确认旧交易。BIP125 规则中，只要交易任意 input 的 `sequence` 小于 `0xfffffffe`，就表示该交易显式允许被替换。`0xfffffffe` 是十六进制，等于十进制 `4294967294`；因此常见 RBF sequence 可使用 `0xfffffffd`，即 `4294967293`。如果不希望交易被替换，通常使用 `0xffffffff`，即 `4294967295`。
 
@@ -737,7 +1569,7 @@ input  = 1.00000000 BTC
 fee      = 0.00020000 BTC  增加
 ```
 
-### 8.4 CPFP 加速
+### 9.4 CPFP 加速
 
 CPFP 是 Child-Pays-For-Parent，即构造一笔高费率子交易花费未确认父交易的输出。矿工为了收取子交易的高手续费，需要同时打包父交易和子交易，因此可以间接加速低费父交易。
 
@@ -751,7 +1583,7 @@ CPFP 是 Child-Pays-For-Parent，即构造一笔高费率子交易花费未确�
 - CPFP 子交易必须只花费已命中系统地址的未确认输出，目标必须是系统归集/热钱包地址，不能混入用户提现输出。
 - 如果父交易后续被 RBF 双花替换，CPFP 子交易会失效；因此 CPFP 前仍要做双花、RBF 标记和多节点 mempool 检查。
 
-## 9. 历史重组和风险
+## 10. 历史重组和风险
 
 BTC 主网相对稳定，但不是不会重组。钱包必须假定：
 
@@ -767,7 +1599,7 @@ BTC 主网相对稳定，但不是不会重组。钱包必须假定：
 - 本地同步器发现超过配置深度的重组时暂停入账和出账，触发告警。
 - 回滚必须包含 UTXO 恢复，否则被回滚交易花费的 UTXO 会在本地永久丢失。
 
-## 10. Memo/Tag
+## 11. Memo/Tag
 
 BTC 不需要 Memo/Tag。交易所应给每个用户派生独立充值地址。
 
@@ -777,7 +1609,7 @@ BTC 不需要 Memo/Tag。交易所应给每个用户派生独立充值地址。
 - UTXO 钱包使用共享地址会让充值归属复杂化，不利于风控、隐私和对账。
 - 如果为了节省地址而共享，会导致所有用户充值进入同一 UTXO 集，后续拆分、找零、归集都更难审计。
 
-## 11. 浏览器和开发资料
+## 12. 浏览器和开发资料
 
 官方/权威资料：
 
@@ -792,6 +1624,11 @@ BTC 不需要 Memo/Tag。交易所应给每个用户派生独立充值地址。
 - BIP173 Bech32 地址：https://bips.dev/173/
 - BIP341 Taproot：https://bips.dev/341/
 - BIP125 RBF：https://bips.dev/125/
+- btcsuite btcd Go packages：https://pkg.go.dev/github.com/btcsuite/btcd
+- btcsuite wire：https://pkg.go.dev/github.com/btcsuite/btcd/wire
+- btcsuite txscript：https://pkg.go.dev/github.com/btcsuite/btcd/txscript
+- btcsuite rpcclient：https://pkg.go.dev/github.com/btcsuite/btcd/rpcclient
+- btcsuite btcutil：https://pkg.go.dev/github.com/btcsuite/btcd/btcutil
 
 常用浏览器/数据平台：
 
@@ -800,7 +1637,7 @@ BTC 不需要 Memo/Tag。交易所应给每个用户派生独立充值地址。
 - Blockchain.com Explorer：https://www.blockchain.com/explorer
 - CoinMarketCap BTC：https://coinmarketcap.com/currencies/bitcoin/
 
-## 12. Vin 和 Vout 管理
+## 13. Vin 和 Vout 管理
 
 原提纲中的两张表：
 
@@ -839,7 +1676,7 @@ type Vouts struct {
 - `Script`/`Witness` 可能很长，建议 raw hex 用 `TEXT`，但业务表只保存必要字段。
 - 缺少唯一键 `chain, txid, tx_out_index` 和 spend 索引。
 
-### 12.1 推荐表结构
+### 13.1 推荐表结构
 
 核心用一张 `wallet_utxos` 表表达“本系统可管理或曾管理的输出”，再用交易表记录完整交易关系。
 
@@ -950,7 +1787,7 @@ CREATE TABLE `wallet_btc_tx_outputs` (
 ) ENGINE=InnoDB COMMENT='BTC 交易输出明细';
 ```
 
-### 12.2 四张表的业务关系与流转
+### 13.2 四张表的业务关系与流转
 
 四张核心表的职责：
 
@@ -1164,7 +2001,7 @@ Created -> Reserved -> Signed -> Broadcast -> Confirmed
 - 已进入 mempool：保持 `PendingSpend`，不能随便释放，必须通过节点、mempool、RBF/双花检测确认后再处理。
 - 交易被 RBF 替换或所在区块回滚：按链上最终交易和本地重扫结果恢复 UTXO 状态。
 
-### 12.3 UTXO 状态机
+### 13.3 UTXO 状态机
 
 ```text
 Available -> Reserved       选币时加业务锁，防并发双花
@@ -1182,7 +2019,7 @@ Spent -> Available          花费该 UTXO 的交易所在区块被回滚
 - 如果广播失败且交易未进入 mempool，可释放为 `Available`。
 - 如果交易进入 mempool 但未确认，不能随便释放；需要 RBF/双花检测后处理。
 
-## 13. 交易示例：如何转成用户 UTXO 记录
+## 14. 交易示例：如何转成用户 UTXO 记录
 
 假设系统托管地址：
 
@@ -1193,7 +2030,7 @@ Spent -> Available          花费该 UTXO 的交易所在区块被回滚
 找零地址         C = bc1q_change...
 ```
 
-### 13.1 外部用户充值
+### 14.1 外部用户充值
 
 链上交易 `txid = tx_deposit_1`：
 
@@ -1260,7 +2097,7 @@ status=Pending/Success 取决于确认数
 
 4. 当安全高度达到 `800000 + confirms`，充值上账，写入 `wallet_balance_log`。
 
-### 13.2 归集交易
+### 14.2 归集交易
 
 系统将用户 UTXO 归集到热钱包，交易 `tx_sweep_1`：
 
@@ -1310,7 +2147,7 @@ status=Available
 
 4. 插入 `wallet_system_txs`，`kind=sweep`，`fee=3000` 可记录在 BTC 交易表或扩展系统交易表。
 
-### 13.3 提现交易
+### 14.3 提现交易
 
 用户提现 1,000,000 sat 到外部地址 `X`，系统使用热钱包 UTXO `tx_sweep_1:0`：
 
@@ -1363,7 +2200,7 @@ status=Success 或确认中状态
 rawtx=<hex>
 ```
 
-## 14. 交易记录管理
+## 15. 交易记录管理
 
 现有 `wallet_inbound` / `wallet_outbound` / `wallet_system_txs` 可以复用，但字段需要适配 BTC：
 
@@ -1416,9 +2253,9 @@ CREATE TABLE `wallet_btc_raw_txs` (
 ) ENGINE=InnoDB COMMENT='BTC 原始交易和费率记录';
 ```
 
-## 15. 对本项目的落地建议
+## 16. 对本项目的落地建议
 
-### 15.1 coinset 配置
+### 16.1 coinset 配置
 
 在 `internal/coinset/chain.go` 增加：
 
@@ -1442,7 +2279,7 @@ FeatureTaproot
 FeatureRBF
 ```
 
-### 15.2 模块拆分
+### 16.2 模块拆分
 
 建议围绕 `08-btc-manager/tx-sign-send/` 和 `08-btc-manager/block-tx-parser/` 分阶段实现：
 
@@ -1453,7 +2290,7 @@ FeatureRBF
 5. 离线签名：在 `tx-sign-send` 中完成 P2WPKH rawtx 构建、签名、验签。
 6. 对账：本地 UTXO sum 与节点 `scantxoutset`/第二索引器结果比对。
 
-### 15.3 最小生产闭环
+### 16.3 最小生产闭环
 
 最小可上线 BTC 主币能力应包含：
 
